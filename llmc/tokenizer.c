@@ -14,9 +14,9 @@ void tokenizer_init(Tokenizer *tokenizer, const char* filename) {
     }
     
     // Read the header.
-    uint32_t header[256];
+    uint32_t header[HEADER_SIZE];
     
-    fread(header, sizeof(uint32_t), 256, file);
+    fread(header, sizeof(uint32_t), HEADER_SIZE, file);
     
     //assert(header[0] == 2024038);
     

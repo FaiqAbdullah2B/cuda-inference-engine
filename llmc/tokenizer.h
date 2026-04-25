@@ -1,7 +1,7 @@
-#ifndef ENGINE_TOKENIZER
-#define ENGINE TOKENIZER
+#ifndef ENGINE_TOKENIZER_H
+#define ENGINE TOKENIZER_H
 
-#include <stdint.h>
+#include "common.h"
 
 typedef struct {
     uint32_t vocab_size;
