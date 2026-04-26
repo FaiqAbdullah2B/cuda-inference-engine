@@ -11,12 +11,12 @@ typedef struct {
     long current_position;
     uint16_t *buffer;
     // size_t num_batches;
-    // int *inputs;
-    // int *targets;
+    int *inputs;
+    int *targets;
 } Dataloader;
 
 int dataloader_init(Dataloader *loader, const char *filename, int B, int T);
-void dataloader_next_batch(Dataloader *loader, int *inputs, int *targets);
+void dataloader_next_batch(Dataloader *loader);
 void dataloader_reset(Dataloader *loader);
 void dataloader_free(Dataloader *loader);
 

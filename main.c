@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <stdlib.h>
 
 #include "./llmc/tokenizer.h"
 #include "./llmc/dataloader.h"
@@ -13,24 +14,19 @@ int main(int argc, char *argv[]) {
     const int T = 64;
     const int batch_size = B*T;
 
-    int inputs[batch_size];
-    int targets[batch_size];
-    dataloader_next_batch(&l, inputs, targets);
+    dataloader_next_batch(&l);
 
-    dataloader_free(&l);
-    
     // tokenizing data
     Tokenizer t;
-    tokenizer_init(&t, "../gpt2_tokenizer.bin");
-    
+    tokenizer_init(&t, "../gpt2_tokenizer.bin"); 
     const char* buf[batch_size];
     const char* targetBuf[batch_size];
     //int tokens[3] = {464, 3290, 318};
     //int ntokens = 3;
     
     for (int i = 0; i < batch_size; i++) {
-        buf[i] = tokenizer_decode(&t, inputs[i]);
-        targetBuf[i] = tokenizer_decode(&t, targets[i]);
+        buf[i] = tokenizer_decode(&t, l.inputs[i]);
+        targetBuf[i] = tokenizer_decode(&t, l.targets[i]);
     }
 
     for (int i = 0; i < batch_size; i++) {
@@ -41,7 +37,8 @@ int main(int argc, char *argv[]) {
         printf("%s", targetBuf[i]);
     }
     printf("\n");
-    tokenizer_free(&t);
 
+    tokenizer_free(&t);
+    dataloader_free(&l);
     return 0;
 }

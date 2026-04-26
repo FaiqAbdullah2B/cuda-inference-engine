@@ -36,6 +36,8 @@ int dataloader_init(Dataloader *loader, const char *filename, int B, int T) {
     }
 
     loader->buffer = (uint16_t*)malloc((B * T + 1) * sizeof(uint16_t));
+    loader->inputs = (int*)malloc(B * T * sizeof(int));
+    loader->targets = (int*)malloc(B * T * sizeof(int));
 
     dataloader_reset(loader);
 
@@ -43,7 +45,7 @@ int dataloader_init(Dataloader *loader, const char *filename, int B, int T) {
     return ntok;
 }
 
-void dataloader_next_batch(Dataloader *loader, int *inputs, int *targets) {
+void dataloader_next_batch(Dataloader *loader) {
     size_t B = loader->B;
     size_t T = loader->T;
     
@@ -54,10 +56,9 @@ void dataloader_next_batch(Dataloader *loader, int *inputs, int *targets) {
     fread(loader->buffer, sizeof(uint16_t), batch_size + 1, loader->tokens_file);
 
     for (int i = 0; i < batch_size; i++) {
-        inputs[i] = loader->buffer[i];
-        targets[i] = loader->buffer[i + 1];
+        loader->inputs[i] = loader->buffer[i];
+        loader->targets[i] = loader->buffer[i + 1];
     }
-
     loader->current_position += batch_size;
     
     // Reminder: revisit wrap around logic later for shards.
@@ -75,4 +76,6 @@ void dataloader_reset(Dataloader *loader) {
 
 void dataloader_free(Dataloader *loader) {
     if (loader->tokens_file) fclose(loader->tokens_file);
+    if (loader->inputs) free(loader->inputs);
+    if (loader->targets) free(loader->targets);
 }
