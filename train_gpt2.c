@@ -2,6 +2,7 @@
 #include "./llmc/dataloader.h"
 #include "./llmc/tokenizer.h"
 #include "./llmc/rand.h"
+#include <math.h>
 
 typedef struct {
     int max_seq_len; // max sequence length
@@ -13,11 +14,16 @@ typedef struct {
     int num_parameters; // total trainable weights
 } GPT2Config;
 
-#define NUM_PARAMETER_TENSORS 2
+#define NUM_PARAMETER_TENSORS 4
 typedef struct {
     float *wte; // weight token embeddings
     float *wtp; // weight token positioning
-//    float 
+    float *ln1w; // 1st layer normalization's weights
+    float *ln1b;
+//    float *ln2w;
+//    float *ln2b;
+//    float *lnfw;
+//    float *lnfb;
 } ParameterTensors;
 
 typedef struct {
@@ -39,8 +45,10 @@ void init_parameters_sizes(size_t *param_sizes, GPT2Config config) {
     size_t C = config.channels;
     size_t maxT = config.max_seq_len;
     size_t L = config.num_layers;
-    param_sizes[0] = Vp * C; // wte
-    param_sizes[1] = maxT * C; // wpe
+    param_sizes[0] = Vp * C;       // wte
+    param_sizes[1] = maxT * C;     // wpe
+    param_sizes[2] = L * C;        // ln1w
+    param_sizes[3] = L * C;        // ln1b
 }
 
 // adds positional encoding and encoded token into an output
@@ -65,6 +73,41 @@ void encoder_forward(float *out,
     }
 }
 
+// layer normalization
+void layernorm_forward(float *out, float *inp, float *weight, float *bias,
+                       int B, int T, int C) {
+    float eps = 1e-5f; // a constant to prevent division by zero
+    for (int b = 0; b < B; b++) {
+        for (int t = 0; t < T; t++) {
+            float *x = inp + b * T * C + t * C;
+            
+            // mean calculation
+            float m = 0.0f;
+            for (int i = 0; i < C; i++) {
+                m += x[i];
+            }
+            m /= C;
+
+            // variance calculation
+            float variance = 0.0f;
+            for (int i = 0; i < C; i++) {
+                float deviation = x[i] - m;
+                variance += deviation * deviation;
+            }
+            variance /= C;
+
+            // normalize and store
+            float *out_ptr = out + b * T * C + t * C;
+            float stdev = 1.0f / sqrtf((float)(variance + eps));
+            for (int i = 0; i < C; i++) {
+                float normalized = stdev * (x[i] - m);
+                float output = normalized * weight[i] + bias[i];
+                out_ptr[i] = output;
+            }
+        }
+    }
+}
+
 float *malloc_and_point_parameters(ParameterTensors *params, size_t *param_sizes) {
     size_t num_params = 0;
     for (size_t i = 0; i < NUM_PARAMETER_TENSORS; i++) {
@@ -76,7 +119,7 @@ float *malloc_and_point_parameters(ParameterTensors *params, size_t *param_sizes
 
     // assign all the tensors
     float **ptrs[] = {
-        &params->wte, &params->wtp
+        &params->wte, &params->wtp, &params->ln1w, &params->ln1b
     };
     
     // set all the starting locations for pointers
@@ -164,10 +207,22 @@ void gpt2_forward(GPT2 *model, int *inputs, int *targets, size_t B, size_t T) {
     ParameterTensors params = model->params;
     float *output_encoded = (float*)malloc(sizeof(float) * B * T * C);
     encoder_forward(output_encoded, inputs, params.wte, params.wtp, B, T, C);
-
+    
+    printf("=================== encoder output ==================\n");
     for (int i = 0; i < B * T; i++) {
         printf("%f ", output_encoded[i]);
     }
+    printf("\n"); 
+    float *ln1w = params.ln1w;
+    float *ln1b = params.ln1b;
+    float *ln1 = (float*)malloc(sizeof(float) * B * T * C);
+    layernorm_forward(ln1, output_encoded, ln1w, ln1b, B, T, C);
+
+    printf("=================== layernorm output ==================\n");
+    for (int i = 0; i < B * T; i++) {
+        printf("%f ", ln1[i]);
+    }
+
     printf("\n");
 }
 
@@ -186,7 +241,7 @@ int main() {
 
     dataloader_next_batch(&train_loader);
     gpt2_forward(&model, train_loader.inputs, train_loader.targets, B, T);
-
+    
     dataloader_free(&train_loader);
     tokenizer_free(&tokenizer);
 }

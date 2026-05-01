@@ -7,4 +7,4 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/build/bin/")
 
 add_subdirectory(llmc)
 add_executable(train_gpt2c train_gpt2.c)
-target_link_libraries(train_gpt2c PRIVATE llmc)
+target_link_libraries(train_gpt2c PRIVATE llmc m)
