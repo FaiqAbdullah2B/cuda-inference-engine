@@ -1,5 +1,5 @@
 #ifndef ENGINE_TOKENIZER_H
-#define ENGINE TOKENIZER_H
+#define ENGINE_TOKENIZER_H
 
 #include "common.h"
 
