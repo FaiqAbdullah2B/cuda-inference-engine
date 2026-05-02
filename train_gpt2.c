@@ -15,7 +15,7 @@ typedef struct {
     int num_parameters; // total trainable weights
 } GPT2Config;
 
-#define NUM_PARAMETER_TENSORS 6
+#define NUM_PARAMETER_TENSORS 8
 typedef struct {
     float *wte; // weight token embeddings
     float *wtp; // weight token positioning
@@ -23,17 +23,22 @@ typedef struct {
     float *ln1b;
     float *qkvw;
     float *qkvb;
+    float *attprojw;
+    float *attprojb;
 //    float *ln2w;
 //    float *ln2b;
 //    float *lnfw;
 //    float *lnfb;
 } ParameterTensors;
 
-#define NUM_ACTIVATION_TENSORS 3
+#define NUM_ACTIVATION_TENSORS 6
 typedef struct {
     float *encoded; // output of encoding
     float *ln1;     // output of first layer normalization
     float *qkv;     // output of qkv
+    float *atty;
+    float *preatt;  // pre attention cache to store QK
+    float *att;
 } ActivationTensors;
 
 typedef struct {
@@ -66,7 +71,9 @@ void init_parameters_sizes(size_t *param_sizes, GPT2Config config) {
     param_sizes[2] = L * C;             // ln1w
     param_sizes[3] = L * C;             // ln1b
     param_sizes[4] = L * (3 * C) * C;   // qkvw
-    param_sizes[5] = L * (3 * C);   // qkvb
+    param_sizes[5] = L * (3 * C);       // qkvb
+    param_sizes[6] = L * C * C;         // attprojw
+    param_sizes[7] = L * C;             // attprojb
 }
 
 // adds positional encoding and encoded token into an output
@@ -148,6 +155,91 @@ void matmul_forward(float *out,
     }
 }
 
+void attention_forward(float *out, float *preatt_cache, float *att_cache,
+                       float *inp, int B, int T, int C, int NH) {
+    int C3 = C * 3;
+    int hs = C / NH;
+    float scale = 1.0 / sqrtf(hs);
+    
+    for (int b = 0; b < B; b++) {
+        for (int t = 0; t < T; t++) {
+            for (int h = 0; h < NH; h++) {
+                // index to query
+                float *queryt = inp + b * T * C3 + t * C3 + h * hs;
+                float maxval = FLT_MIN;
+                // preceding sequence of words only
+                for (int t2 = 0; t2 <= t; t2++) {
+                    // index to key
+                    float *keyt = inp + b * T * C3 + t2 * C3 + h * hs + C;
+                    
+                    // perform val = (Q . K) / sqrt(hs)
+                    float val = 0.0f;
+                    for (int i = 0; i < hs; i++) {
+                        val += queryt[i] * keyt[i];
+                    }
+                    val *= scale;
+
+                    if (val > maxval) {
+                        maxval = val;
+                    }
+
+                    preatt_cache[t2] = val;
+                }
+
+                // softmax exponent calculation
+                float expsum = 0.0f;
+                for (int t2 = 0; t2 <= t; t2++) {
+                    float expv = expf(preatt_cache[t2] - maxval);
+                    expsum += expv;
+                    att_cache[t2] = expv;
+                }
+                float expsum_inv = expsum == 0.0f ? 0.0f : 1.0f / expsum;
+                
+                // normalization to get softmax
+                for (int t2 = 0; t2 < t; t2++) {
+                    if (t2 <= t) {
+                        att_cache[t2] *= expsum_inv;
+                    }
+                    else {
+                        att_cache[t2] = 0.0f;
+                    }
+                }
+
+                float *out_bth = out + b * T * C + t * C + h * hs;
+                
+                for (int i = 0; i < hs; i++) {
+                    out_bth[i] = 0.0f;
+                }
+
+                // accumulate values from all the heads into out of attention
+                for (int t2 = 0; t2 <= t; t2++) {
+                    // value index
+                    float *value_t2 = inp + b * T * C3 + t2 * C3 + h * hs + C*2;
+                    // multiply and add
+                    for (int i = 0; i < hs; i++) {
+                        out_bth[i] += att_cache[t2] * value_t2[i];
+                    }
+                }
+            }
+        }
+    }
+}
+
+void residual_forward(float *out, float *inp1, float *inp2, int N) {
+    for (int i = 0; i < N; i++) {
+        out[i] = inp1[i] + inp2[i];
+    }
+}
+
+#define GELU_SCALING_FACTOR sqrtf(2.0f / M_PI)
+void gelu_forward(float *out, float *inp, int N) {
+    for (int i = 0; i < N; i++) {
+        float x = inp[i];
+        float cube = 0.044715f * x * x * x;
+        out[i] = 0.5f * x * (1.0f + tanh(GELU_SCALING_FACTOR * (x + cube)));
+    }
+}
+
 float *malloc_and_point_parameters(ParameterTensors *params, size_t *param_sizes) {
     size_t num_params = 0;
     for (size_t i = 0; i < NUM_PARAMETER_TENSORS; i++) {
@@ -160,7 +252,7 @@ float *malloc_and_point_parameters(ParameterTensors *params, size_t *param_sizes
     // assign all the tensors
     float **ptrs[] = {
         &params->wte, &params->wtp, &params->ln1w, &params->ln1b, 
-        &params->qkvw, &params->qkvb
+        &params->qkvw, &params->qkvb, &params->attprojw, &params->attprojb
     };
     
     // set all the starting locations for pointers
@@ -180,7 +272,8 @@ float *malloc_and_point_activations(ActivationTensors *acts, size_t *act_sizes) 
     
     float *acts_memory = (float*)malloc(num_activations * sizeof(float));
     float **ptrs[] = {
-        &acts->encoded, &acts->ln1, &acts->qkv
+        &acts->encoded, &acts->ln1, &acts->qkv, &acts->atty, 
+        &acts->preatt, &acts->att
     };
 
     float *acts_memory_iterator = acts_memory;
@@ -273,6 +366,9 @@ void gpt2_forward(GPT2 *model, int *inputs, int *targets, size_t B, size_t T) {
         model->act_sizes[0] = B * T * C;            // encoded
         model->act_sizes[1] = L * B * T * C;        // ln1
         model->act_sizes[2] = L * B * T * C * 3;    // qkv
+        model->act_sizes[3] = L * B * T * C;        // atty
+        model->act_sizes[4] = L * B * NH * T * T;   // preatt
+        model->act_sizes[5] = L * B * NH * T * T;   // att
         size_t num_activations = 0;
         for (int i = 0; i < NUM_ACTIVATION_TENSORS; i++) {
             num_activations += model->act_sizes[i];
@@ -316,6 +412,7 @@ void gpt2_forward(GPT2 *model, int *inputs, int *targets, size_t B, size_t T) {
     }
     printf("\n");
 
+/*
     for (int l = 0; l < L; l++) {
         float *ln1_l = acts.ln1 + l * B * T * C;
 
@@ -326,10 +423,25 @@ void gpt2_forward(GPT2 *model, int *inputs, int *targets, size_t B, size_t T) {
 
         matmul_forward(qkv_l, ln1_l, qkvw_l, qkvb_l, B, T, C, 3 * C);
     }
-
+*/
+    float *ln1_l = acts.ln1;
+    float *qkv_l = acts.qkv;
+    float *qkvw_l = params.qkvw;    
+    float *qkvb_l = params.qkvb;
+    matmul_forward(qkv_l, ln1_l, qkvw_l, qkvb_l, B, T, C, 3 * C);
     printf("=================== QKV output ==================\n");
     for (int i = 0; i < B * T; i++) {
         printf("%f ", acts.qkv[i]);
+    }
+    printf("\n");
+    
+    float *atty = acts.atty;
+    float *att = acts.att;
+    float *preatt = acts.preatt;
+    attention_forward(atty, preatt, att, qkv_l, B, T, C, NH);
+    printf("=================== Attention output ==================\n");
+    for (int i = 0; i < B * T; i++) {
+        printf("%f ", atty[i]);
     }
     printf("\n");
 }
