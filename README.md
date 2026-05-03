@@ -99,7 +99,7 @@ manually tracking tensor shapes through every layer until the architecture actua
 - CUDA Toolkit 12.x
 - GCC / Clang
 - Python 3.x + Jupyter (for the notebook)
-- GPT-2 124M weights (download via `wget` script, see below)
+- GPT-2 124M weights (download from `./dev/download_starter_pack.sh` by karpathy)
 
 
 ## Concepts Covered
