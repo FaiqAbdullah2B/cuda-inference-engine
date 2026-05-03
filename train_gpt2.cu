@@ -17,23 +17,23 @@ typedef struct {
     int num_parameters; // total trainable weights
 } GPT2Config;
 
-#define NUM_PARAMETER_TENSORS 2
+#define NUM_PARAMETER_TENSORS 6
 typedef struct {
     float *wte; // weight token embeddings
     float *wpe; // weight positional encoding
-    // float *ln1w; // 1st layer normalization's weights
-    // float *ln1b;
-    // float *qkvw;
-    // float *qkvb;
+    float *ln1w; // 1st layer normalization's weights
+    float *ln1b;
+    float *qkvw;
+    float *qkvb;
     // float *attprojw;
     // float *attprojb;
 } ParameterTensors;
 
-#define NUM_ACTIVATION_TENSORS 1
+#define NUM_ACTIVATION_TENSORS 3
 typedef struct {
     float *encoded; // output of encoding
-    // float *ln1;     // output of first layer normalization
-    // float *qkv;     // output of qkv
+    float *ln1;     // output of first layer normalization
+    float *qkv;     // output of qkv
     // float *atty;
     // float *preatt;  // pre attention cache to store QK
     // float *att;
@@ -67,10 +67,10 @@ void init_parameters_sizes(size_t *param_sizes, GPT2Config config) {
     size_t L = config.num_layers;
     param_sizes[0] = Vp * C;            // wte
     param_sizes[1] = maxT * C;          // wpe
-    // param_sizes[2] = L * C;             // ln1w
-    // param_sizes[3] = L * C;             // ln1b
-    // param_sizes[4] = L * (3 * C) * C;   // qkvw
-    // param_sizes[5] = L * (3 * C);       // qkvb
+    param_sizes[2] = L * C;             // ln1w
+    param_sizes[3] = L * C;             // ln1b
+    param_sizes[4] = L * (3 * C) * C;   // qkvw
+    param_sizes[5] = L * (3 * C);       // qkvb
     // param_sizes[6] = L * C * C;         // attprojw
     // param_sizes[7] = L * C;             // attprojb
 }
@@ -81,6 +81,8 @@ void init_activation_sizes(size_t *act_sizes, int B, int T, GPT2Config config) {
     size_t NH = config.num_heads;
     size_t C = config.channels;
     act_sizes[0] = B * T * C; // encoded
+    act_sizes[1] = L * B * T * C; // layernorm 1
+    act_sizes[2] = L * B * T * C * 3; // qkv
 }
 
 // kernels
@@ -104,6 +106,62 @@ __global__ void encoder_forward_kernel(float *out,
     }
 }
 
+#define EPSILON 1e-5f
+__global__ void layernorm_forward_kernel(float *out, float *inp, float *weight,
+                                         float* bias, int B, int T, int C) {
+    int b = blockIdx.y * blockDim.y + threadIdx.y; // row
+    int t = blockIdx.x * blockDim.x + threadIdx.x; // col
+
+    if (b >= 0 && b < B && t >= 0 && t < T) {
+        // index to the token
+        float *x = inp + b * T * C + t * C;
+
+        // calculate mean
+        float mean = 0.0f;
+        for (int i = 0; i < C; i++) {
+            mean += x[i];
+        }
+        mean /= C;
+
+        // calculate variance
+        float variance = 0.0f;
+        float deviation = 0.0f;
+        for (int i = 0; i < C; i++) {
+            deviation = x[i] - mean;
+            variance += deviation * deviation;
+        }
+        variance /= C;
+
+        // normalize and store
+        float *out_ptr = out + b * T * C + t * C;
+        float stdev = 1.0f / sqrtf((float)(variance + EPSILON));
+        float normalized = 0.0f;
+        for (int i = 0; i < C; i++) {
+            normalized = stdev * (x[i] - mean);
+            out_ptr[i] = normalized * weight[i] + bias[i];
+        }
+    }
+}
+
+__global__ void matmul_forward_kernel(float *out,
+                                      float *inp, float *weight, float *bias,
+                                      int B, int T, int C, int OC) {
+    int b = blockIdx.z * blockDim.z + threadIdx.z;
+    int t = blockIdx.y * blockDim.y + threadIdx.y;
+    int o = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (b >= 0 && b < B && t >= 0 && t < T && o >= 0 && o < OC) {
+        int outIdx = b * T * OC + t * OC + o;
+        int inpStartIdx = b * T * C + t * C;
+        float val = (bias != NULL) ? bias[o] : 0.0f;
+        float *wrow = weight + o*C;
+        for (int i = 0; i < C; i++) {
+            val += inp[inpStartIdx + i] * wrow[i];
+        }
+        out[outIdx] = val;
+    }
+}
+
 // kernel launchers
 void encoder_forward(float *out,
                      int *inp, float *wte, float *wpe,
@@ -116,6 +174,33 @@ void encoder_forward(float *out,
     dim3 blockDim = dim3(blockSize_x, blockSize_y, 1);
     encoder_forward_kernel<<<gridDim, blockDim>>>(out, inp, wte, wpe, B, T, C);
     cudaCheck(cudaGetLastError());
+}
+
+void layernorm_forward(float *out, float *inp, float *weight,
+                       float* bias, int B, int T, int C) {
+    const int blockSize_y = 16;
+    const int blockSize_x = 32;
+    const int gridSize_y = CEIL_DIV(B, blockSize_y);
+    const int gridSize_x = CEIL_DIV(T, blockSize_x);
+    dim3 gridDim = dim3(gridSize_x, gridSize_y, 1);
+    dim3 blockDim = dim3(blockSize_x, blockSize_y, 1);
+    layernorm_forward_kernel<<<gridDim, blockDim>>>(
+        out, inp, weight, bias, B, T, C);
+}
+
+void matmul_forward(float *out,
+                    float *inp, float *weight, float *bias,
+                    int B, int T, int C, int OC) {
+    const int blockSize_z = 32;
+    const int blockSize_y = 8;
+    const int blockSize_x = 1;
+    const int gridSize_z = CEIL_DIV(B, blockSize_z);
+    const int gridSize_y = CEIL_DIV(T, blockSize_y);
+    const int gridSize_x = CEIL_DIV(OC, blockSize_x);
+    dim3 gridDim = dim3(gridSize_x, gridSize_y, gridSize_z);
+    dim3 blockDim = dim3(blockSize_x, blockSize_y, blockSize_z);
+    matmul_forward_kernel<<<gridDim, blockDim>>>(
+        out, inp, weight, bias, B, T, C, OC);
 }
 
 float *malloc_and_point_parameters(ParameterTensors* params, 
@@ -138,7 +223,8 @@ float *malloc_and_point_parameters(ParameterTensors* params,
     }
 
     float **ptrs[] = {
-        &params->wte, &params->wpe
+        &params->wte, &params->wpe, &params->ln1w, &params->ln1b, 
+        &params->qkvw, &params->qkvb
     };
 
     float *params_memory_iterator = params_memory;
@@ -166,7 +252,7 @@ float* malloc_and_point(float** targets[], const size_t* act_sizes, int n) {
 
 float* malloc_and_point_activations(ActivationTensors* acts, const size_t* act_sizes) {
     float** ptrs[] = {
-        &acts->encoded
+        &acts->encoded, &acts->ln1, &acts->qkv
     };
     return malloc_and_point(ptrs, act_sizes, NUM_ACTIVATION_TENSORS);
 }
@@ -283,20 +369,46 @@ void gpt2_forward(GPT2 *model, int *inputs, int *targets, int B, int T) {
     ParameterTensors params = model->params;
     ActivationTensors acts = model->acts;
     float *residual;
+    float *intermediate_result = (float*)malloc(B * T * 4 * C * sizeof(float));
 
     encoder_forward(acts.encoded, model->inputs, params.wte, params.wpe, B, T, C);
-    float *encoder_result = (float*)malloc(B * T * C * sizeof(float));
-    cudaMemcpy(encoder_result, acts.encoded, B * T * C * sizeof(float), cudaMemcpyDeviceToHost);
+    cudaMemcpy(intermediate_result, acts.encoded, B * T * C * sizeof(float), cudaMemcpyDeviceToHost);
     printf("=================== encoder output ==================\n");
     for (int i = 0; i < B * T; i++) {
-        printf("%f ", encoder_result[i]);
+        printf("%f ", intermediate_result[i]);
         if (i % 100 == 0) {
             printf("\n");
         }
     }
     printf("\n");
 
-    free(encoder_result);
+    layernorm_forward(
+        acts.ln1, acts.encoded, params.ln1w, params.ln1b, B, T, C
+    );
+    cudaMemcpy(intermediate_result, acts.ln1, B * T * C * sizeof(float), cudaMemcpyDeviceToHost);
+    printf("=================== layernorm output ==================\n");
+    for (int i = 0; i < B * T; i++) {
+        printf("%f ", intermediate_result[i]);
+        if (i % 100 == 0) {
+            printf("\n");
+        }
+    }
+    printf("\n");
+
+    matmul_forward(
+        acts.qkv, acts.ln1, params.qkvw, params.qkvb, B, T, C, 3 * C
+    );
+    cudaMemcpy(intermediate_result, acts.qkv, B * T * C * 3 * sizeof(float), cudaMemcpyDeviceToHost);
+    printf("=================== QKV output ==================\n");
+    for (int i = 0; i < B * T; i++) {
+        printf("%f ", intermediate_result[i]);
+        if (i % 100 == 0) {
+            printf("\n");
+        }
+    }
+    printf("\n");
+
+    free(intermediate_result);
 }
 
 void gpt2_free(GPT2 *model) {
