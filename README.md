@@ -55,10 +55,10 @@ manually tracking tensor shapes through every layer until the architecture actua
 | Encoder (token emb + positional emb) | Done |
 | LayerNorm forward | Done |
 | QKV matmul | Done |
-| Causal self-attention | Done |
+| Masked multi-headed attention | Done |
 | GELU activation | Done |
 | Residual connections | Done |
-| Full forward pass on TinyShakespeare | Done |
+| Full forward pass on TinyShakespeare | In Progress |
 
 **Batch config:** 4 batches × 64 tokens
 
@@ -75,7 +75,9 @@ manually tracking tensor shapes through every layer until the architecture actua
 | GELU kernel | In Progress |
 | Full forward pass | In Progress |
 
-**Batch config:** 512 (hardcoded)
+**Batch config:** 4 batches x 64 tokens
+
+**Block Dim:** Hardcoded to 512 threads per block
 
 ---
 
