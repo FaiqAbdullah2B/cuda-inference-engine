@@ -81,7 +81,7 @@ void init_activation_sizes(size_t *act_sizes, int B, int T, GPT2Config config) {
     size_t NH = config.num_heads;
     size_t C = config.channels;
     act_sizes[0] = B * T * C; // encoded
-    act_sizes[1] = B * T * C; // layernorm 1
+    act_sizes[1] = L * B * T * C; // layernorm 1
     act_sizes[2] = L * B * T * C * 3; // qkv
 }
 
