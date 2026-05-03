@@ -39,6 +39,12 @@ Input Tokens
 
 ## Implementation Progress
 
+### The Real Work
+
+Before a single line of C was written, this project required roughly *15-20+ hours* of groundwork:
+reading the GPT-2 paper, tracing Karpathy's llm.c line by line, watching the build video, and
+manually tracking tensor shapes through every layer until the architecture actually made sense.
+
 ### CPU (C)
 
 | Component | Status |
@@ -108,7 +114,6 @@ Input Tokens
 **From the notebook:**
 - Tensor shape tracking through every layer
 - Attention pattern visualization
-- Sanity-checking GPU vs CPU outputs
 
 ---
 
