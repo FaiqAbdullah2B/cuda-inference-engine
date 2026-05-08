@@ -225,6 +225,24 @@ __global__ void attention_forward_kernel(float *out, float *preatt_cache,
     }
 }
 
+
+__global__ void residual_forward_kernel(float *out, float *inp1, float *inp2, int N) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= 0 && i < N)
+        out[i] = inp1[i] + inp2[i];
+}
+
+#define M_PI 3.14159265358979323846 // math.h won't help...
+#define GELU_SCALING_FACTOR sqrtf(2.0f / M_PI)
+__global__ void gelu_forward_kernel(float *out, float *inp, int N) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= 0 && i < N) {
+        float x = inp[i];
+        float cube = 0.044715f * x * x * x;
+        out[i] = 0.5f * x * (1.0f + tanhf(GELU_SCALING_FACTOR * (x + cube)));
+    }
+}
+
 // kernel launchers
 void encoder_forward(float *out,
                      int *inp, float *wte, float *wpe,
@@ -279,6 +297,22 @@ void attention_forward(float *out, float *preatt_cache,
     dim3 blockDim = dim3(blockSize_x, blockSize_y, blockSize_z);
     attention_forward_kernel<<<gridDim, blockDim>>>(
         out, preatt_cache, att_cache, inp, B, T, C, NH);
+}
+
+void residual_forward(float *out, float *inp1, float *inp2, int N) {
+    const int blockSize_x = 512;
+    const int gridSize_x = CEIL_DIV(N, blockSize_x);
+    dim3 gridDim = dim3(gridSize_x , 1, 1);
+    dim3 blockDim = dim3(blockSize_x, 1, 1);
+    residual_forward_kernel<<<gridDim, blockDim>>>(out, inp1, inp2, N);
+}
+
+void gelu_forward(float *out, float *inp, int N) {
+    const int blockSize_x = 512;
+    const int gridSize_x = CEIL_DIV(N, blockSize_x);
+    dim3 gridDim = dim3(gridSize_x , 1, 1);
+    dim3 blockDim = dim3(blockSize_x, 1, 1);
+    gelu_forward_kernel<<<gridDim, blockDim>>>(out, inp, N);
 }
 
 float *malloc_and_point_parameters(ParameterTensors* params, 
@@ -497,7 +531,7 @@ void gpt2_forward(GPT2 *model, int *inputs, int *targets, int B, int T) {
         }
     }
     printf("\n");
-    
+
     free(intermediate_result);
 }
 
