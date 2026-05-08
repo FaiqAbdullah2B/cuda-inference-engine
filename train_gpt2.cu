@@ -17,7 +17,7 @@ typedef struct {
     int num_parameters; // total trainable weights
 } GPT2Config;
 
-#define NUM_PARAMETER_TENSORS 6
+#define NUM_PARAMETER_TENSORS 8
 typedef struct {
     float *wte; // weight token embeddings
     float *wpe; // weight positional encoding
@@ -25,18 +25,18 @@ typedef struct {
     float *ln1b;
     float *qkvw;
     float *qkvb;
-    // float *attprojw;
-    // float *attprojb;
+    float *attprojw;
+    float *attprojb;
 } ParameterTensors;
 
-#define NUM_ACTIVATION_TENSORS 3
+#define NUM_ACTIVATION_TENSORS 6
 typedef struct {
     float *encoded; // output of encoding
     float *ln1;     // output of first layer normalization
     float *qkv;     // output of qkv
-    // float *atty;
-    // float *preatt;  // pre attention cache to store QK
-    // float *att;
+    float *atty;
+    float *preatt;  // pre attention cache to store QK
+    float *att;
 } ActivationTensors;
 
 typedef struct {
@@ -71,8 +71,8 @@ void init_parameters_sizes(size_t *param_sizes, GPT2Config config) {
     param_sizes[3] = L * C;             // ln1b
     param_sizes[4] = L * (3 * C) * C;   // qkvw
     param_sizes[5] = L * (3 * C);       // qkvb
-    // param_sizes[6] = L * C * C;         // attprojw
-    // param_sizes[7] = L * C;             // attprojb
+    param_sizes[6] = L * C * C;         // attprojw
+    param_sizes[7] = L * C;             // attprojb
 }
 
 void init_activation_sizes(size_t *act_sizes, int B, int T, GPT2Config config) {
@@ -83,6 +83,9 @@ void init_activation_sizes(size_t *act_sizes, int B, int T, GPT2Config config) {
     act_sizes[0] = B * T * C; // encoded
     act_sizes[1] = L * B * T * C; // layernorm 1
     act_sizes[2] = L * B * T * C * 3; // qkv
+    act_sizes[3] = L * B * T * C;        // atty
+    act_sizes[4] = L * B * NH * T * T;   // preatt
+    act_sizes[5] = L * B * NH * T * T;   // att
 }
 
 // kernels
@@ -162,6 +165,66 @@ __global__ void matmul_forward_kernel(float *out,
     }
 }
 
+__device__ void dot_product(float *out, float *a, float *b, int n) {
+    for (int i = 0; i < n; i++) {
+        *out += a[i] * b[i];
+    }
+}
+
+__global__ void attention_forward_kernel(float *out, float *preatt_cache,
+                                         float *att_cache, float *inp, 
+                                         int B, int T, int C, int NH) {
+    int b = blockIdx.z * blockDim.z + threadIdx.z;
+    int t = blockIdx.y * blockDim.y + threadIdx.y;
+    int h = blockIdx.x * blockDim.x + threadIdx.x; // head index
+    
+    int C3 = C * 3;
+    int hs = C / NH;
+    float scale = 1.0 / sqrtf(hs);
+
+    if (b >= 0 && b < B && t >= 0 && t < T && h >= 0 && h < NH) {
+
+        float *queryt = inp + b * T * C3 + t * C3 + h * hs;
+        float maxVal = FLT_MIN;
+
+        int row_offset = b * (NH * T * T) + h * (T * T) + t * T; 
+        // masked preceding sequence of words only
+        // lots of control divergence here
+        for (int t2 = 0; t2 <= t; t2++) {
+            float *keyt = inp + b * T * C3 + t2 * C3 + h * hs + C;
+
+            // perform val = ((Q . K) / sqrt(hs))
+            float val = 0.0f;
+            dot_product(&val, queryt, keyt, hs);
+            val *= scale;
+
+            if (val > maxVal) {
+                maxVal = val;
+            }
+
+            preatt_cache[row_offset + t2] = val;
+        }
+
+        float exp_sum = 0.0f;
+        for (int t2 = 0; t2 <= t; t2++) {
+            // Subtract maxVal for numerical stability (Safe Softmax)
+            float e = expf(preatt_cache[row_offset + t2] - maxVal);
+            att_cache[row_offset + t2] = e;     // Store e^(Q.K)
+            exp_sum += e;          // Accumulate sum
+        }
+
+        int out_offset = b * T * C + t * C + h * hs;
+        for (int t2 = 0; t2 <= t; t2++) {
+            float weight = att_cache[row_offset + t2] / exp_sum; // The actual Softmax score
+            float *valt = inp + b * T * C3 + t2 * C3 + h * hs + 2 * C; // Offset for V
+            // Accumulate into the output vector for this head/timestep
+            for (int i = 0; i < hs; i++) {
+                out[out_offset + i] += weight * valt[i];
+            }
+        }
+    }
+}
+
 // kernel launchers
 void encoder_forward(float *out,
                      int *inp, float *wte, float *wpe,
@@ -203,6 +266,21 @@ void matmul_forward(float *out,
         out, inp, weight, bias, B, T, C, OC);
 }
 
+void attention_forward(float *out, float *preatt_cache,
+                       float *att_cache, float *inp, 
+                       int B, int T, int C, int NH) {
+    const int blockSize_z = 32;
+    const int blockSize_y = 8;
+    const int blockSize_x = 1;
+    const int gridSize_z = CEIL_DIV(B, blockSize_z);
+    const int gridSize_y = CEIL_DIV(T, blockSize_y);
+    const int gridSize_x = CEIL_DIV(NH, blockSize_x);
+    dim3 gridDim = dim3(gridSize_x, gridSize_y, gridSize_z);
+    dim3 blockDim = dim3(blockSize_x, blockSize_y, blockSize_z);
+    attention_forward_kernel<<<gridDim, blockDim>>>(
+        out, preatt_cache, att_cache, inp, B, T, C, NH);
+}
+
 float *malloc_and_point_parameters(ParameterTensors* params, 
                                    size_t *param_sizes, bool on_device) {
     // on_device CPU = false and GPU = true
@@ -224,7 +302,7 @@ float *malloc_and_point_parameters(ParameterTensors* params,
 
     float **ptrs[] = {
         &params->wte, &params->wpe, &params->ln1w, &params->ln1b, 
-        &params->qkvw, &params->qkvb
+        &params->qkvw, &params->qkvb, &params->attprojw, &params->attprojb
     };
 
     float *params_memory_iterator = params_memory;
@@ -242,6 +320,7 @@ float* malloc_and_point(float** targets[], const size_t* act_sizes, int n) {
     }
     float* acts_memory;
     cudaCheck(cudaMalloc((void**)&acts_memory, num_activations * sizeof(float)));
+    cudaCheck(cudaMemset(acts_memory, 0, num_activations * sizeof(float))); // init with 0
     float* acts_memory_iterator = acts_memory;
     for (size_t i = 0; i < n; i++) {
         *(targets[i]) = acts_memory_iterator;
@@ -252,7 +331,7 @@ float* malloc_and_point(float** targets[], const size_t* act_sizes, int n) {
 
 float* malloc_and_point_activations(ActivationTensors* acts, const size_t* act_sizes) {
     float** ptrs[] = {
-        &acts->encoded, &acts->ln1, &acts->qkv
+        &acts->encoded, &acts->ln1, &acts->qkv, &acts->atty, &acts->preatt, &acts->att
     };
     return malloc_and_point(ptrs, act_sizes, NUM_ACTIVATION_TENSORS);
 }
@@ -408,6 +487,17 @@ void gpt2_forward(GPT2 *model, int *inputs, int *targets, int B, int T) {
     }
     printf("\n");
 
+    attention_forward(acts.atty, acts.preatt, acts.att, acts.qkv, B, T, C, NH);
+    cudaMemcpy(intermediate_result, acts.atty, B * T * C * 3 * sizeof(float), cudaMemcpyDeviceToHost);
+    printf("=================== Attention output ==================\n");
+    for (int i = 0; i < B * T; i++) {
+        printf("%f ", intermediate_result[i]);
+        if (i % 100 == 0) {
+            printf("\n");
+        }
+    }
+    printf("\n");
+    
     free(intermediate_result);
 }
 
