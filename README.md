@@ -71,11 +71,12 @@ manually tracking tensor shapes through every layer until the architecture actua
 | Encoder kernel | Done |
 | LayerNorm kernel | Done |
 | MatMul kernel | Done |
-| Attention kernel | In Progress |
-| GELU kernel | In Progress |
-| Full forward pass | In Progress |
+| Attention kernel | Done |
+| GELU kernel | Done |
+| Softmax kernel | Done |
+| Full forward pass on TinyShakespeare | Done |
 
-**Batch config:** 4 batches x 64 tokens
+**Batch config:** 1 batches x 128 tokens
 
 **Block Dim:** Hardcoded to 512 threads per block
 
