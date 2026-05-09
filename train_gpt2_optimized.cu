@@ -162,6 +162,80 @@ __global__ void encoder_forward_kernel(float *out,
     }
 }
 
+#define EPSILON 1e-5f
+#define LAYERNORM_BLOCK_DIM_Y 4
+#define LAYERNORM_BLOCK_DIM_X 256 // hard coded to 256 for reduction sum.
+
+__device__ float reduction_sum(float val, float* input_s) {
+    int tx = threadIdx.x;
+
+    input_s[tx] = val;
+    __syncthreads();
+
+    for (unsigned int stride = blockDim.x/2; stride >= 1; stride /= 2) {
+        if (threadIdx.x < stride) {
+            input_s[tx] += input_s[tx + stride];
+        }        
+        __syncthreads();
+    }
+
+    return input_s[0];
+}
+
+__global__ void layernorm_forward_kernel(float *out, float *inp, 
+                                         const float * __restrict__ weight,
+                                         const float * __restrict__ bias, 
+                                         int B, int T, int C) {
+    int b = blockIdx.z * blockDim.z + threadIdx.z; // depth
+    int t = blockIdx.y * blockDim.y + threadIdx.y; // row
+    int c = (blockIdx.x * blockDim.x + threadIdx.x) * 4; // col
+    
+    __shared__ float mean_s[LAYERNORM_BLOCK_DIM_Y][256];
+
+    float4 x;
+    float4 weights;
+    float4 biases;
+    float mean = 0.0f;
+    if (b >= 0 && b < B && t >= 0 && t < T && c >= 0 && c < C) {
+        // index to the token
+        x = *(float4 *)&inp[b * T * C + t * C + c];
+        // add local values
+        mean += (x.x + x.w + x.y + x.z);
+    }
+
+    mean = reduction_sum(mean, mean_s[threadIdx.y]);
+    mean /= C;
+
+    float var = 0.0f;
+    float4 deviation;
+    if (b < B && t < T && c < C) {
+        deviation.x = x.x - mean;
+        deviation.y = x.y - mean;
+        deviation.z = x.z - mean;
+        deviation.w = x.w - mean;
+        var = (deviation.x * deviation.x) + (deviation.y * deviation.y) +
+                    (deviation.z * deviation.z) + (deviation.w * deviation.w);
+    }
+
+    var = reduction_sum(var, mean_s[threadIdx.y]);
+    var /= C;
+
+    if (b >= 0 && b < B && t >= 0 && t < T && c >= 0 && c < C) {
+        // normalize and store
+        float stdev = 1.0f / sqrtf((float)(var + EPSILON));
+        weights = *(float4 *)&weight[c];
+        biases = *(float4 *)&bias[c];
+
+        // reuse deviation to save space in register :')
+        deviation.x = deviation.x * stdev * weights.x + biases.x;
+        deviation.y = deviation.y * stdev * weights.y + biases.y;
+        deviation.z = deviation.z * stdev * weights.z + biases.z;
+        deviation.w = deviation.w * stdev * weights.w + biases.w;
+        
+        *(float4 *)(&out[b * T * C + t * C + c]) = deviation;
+    }
+}
+
 // kernel launchers
 void encoder_forward(float *out,
                     int *inp, float *wte, float *wpe,
@@ -175,6 +249,23 @@ void encoder_forward(float *out,
     dim3 blockDim = dim3(blockDim_x, blockDim_y, blockDim_z);
     dim3 gridDim = dim3(gridDim_x, gridDim_y, gridDim_z);
     encoder_forward_kernel<<<gridDim, blockDim>>>(out, inp, wte, wpe, B, T, C);
+    cudaCheck(cudaGetLastError());
+}
+
+void layernorm_forward(float *out, float *inp, float *weight,
+                       float* bias, int B, int T, int C) {
+    int blockDim_z = 1;
+    int blockDim_y = LAYERNORM_BLOCK_DIM_Y;
+    int blockDim_x = LAYERNORM_BLOCK_DIM_X;
+
+    int gridDim_z = CEIL_DIV(B, blockDim_z);
+    int gridDim_y = CEIL_DIV(T, blockDim_y);
+    int gridDim_x = 1; // one block handles the entire width
+
+    dim3 blockDim = dim3(blockDim_x, blockDim_y, blockDim_z);
+    dim3 gridDim = dim3(gridDim_x, gridDim_y, gridDim_z);
+    layernorm_forward_kernel<<<gridDim, blockDim>>>(
+        out, inp, weight, bias, B, T, C);
     cudaCheck(cudaGetLastError());
 }
 
@@ -358,8 +449,9 @@ void gpt2_forward(GPT2 *model, int *inputs, int *targets, int B, int T) {
     ParameterTensors params = model->params;
     ActivationTensors acts = model->acts;
     float *residual;
-
     encoder_forward(acts.encoded, model->inputs, params.wte, params.wpe, B, T, C);
+    
+    layernorm_forward(acts.ln1, acts.encoded, params.ln1w, params.ln1b, B, T, C);
 }
 
 void generate_text(GPT2 *model, Tokenizer *tokenizer, int *prompt_tokens, int B, int T, int max_new_tokens) {
@@ -420,8 +512,8 @@ int main() {
     gpt2_build_from_checkpoint(&model, "../gpt2_124M.bin");
 
     const char* tiny_shake_train = "../dev/data/tinyshakespeare/tiny_shakespeare_train.bin";
-    int B = 24;
-    int T = 256;
+    int B = 4;
+    int T = 64;
     Dataloader train_loader;
     dataloader_init(&train_loader, tiny_shake_train, B, T);
 
