@@ -37,7 +37,7 @@ typedef struct {
     float *lnfb;        // final normalization's biases
 } ParameterTensors;
 
-#define NUM_ACTIVATION_TENSORS 17
+#define NUM_ACTIVATION_TENSORS 16
 typedef struct {
     float *encoded; // output of encoding
     float *ln1;     // output of first layer normalization
@@ -556,7 +556,6 @@ void gpt2_forward(GPT2 *model, int *inputs, int *targets, int B, int T) {
         // also create memory for caching inputs and targets
         cudaCheck(cudaMalloc((void**)&model->inputs, B * T * sizeof(int)));
         cudaCheck(cudaMalloc((void**)&model->targets, B * T * sizeof(int)));
-        // cudaCheck(cudaMallocHost((void**)&model->cpu_losses, B * T * sizeof(float)));
     }
     else {
         if (B != model->batch_size || T != model->seq_len) {
