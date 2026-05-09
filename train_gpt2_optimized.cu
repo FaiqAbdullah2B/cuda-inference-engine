@@ -124,6 +124,7 @@ void init_activation_sizes(size_t *act_sizes, int B, int T, GPT2Config config) {
 }
 
 // kernels
+#define ENCODER_BLOCK_DIM_Y 16
 __global__ void encoder_forward_kernel(float *out,
                                        int *inp, float *wte, float *wpe,
                                        int B, int T, int C) {
@@ -131,17 +132,19 @@ __global__ void encoder_forward_kernel(float *out,
     int t = blockIdx.y * blockDim.y + threadIdx.y; // row
     int c = (blockIdx.x * blockDim.x + threadIdx.x) * 4; // col
 
-    __shared__ int token_id;
+    __shared__ int token_ids[ENCODER_BLOCK_DIM_Y];
 
     if (b >= 0 && b < B && t >= 0 && t < T && c >= 0 && c < C) {
-        if (threadIdx.x == 0)
-            token_id = inp[b * T + t];
+        if (threadIdx.x == 0) {
+            // Store the token in the specific slot for this row
+            token_ids[threadIdx.y] = inp[b * T + t];
+        }
     }
     __syncthreads();
     
     if (b >= 0 && b < B && t >= 0 && t < T && c >= 0 && c < C) {
         // using float4 to reduce 12 accesses per 4 values to just 3 accesses
-        float4 *wte_vec = (float4*)(&wte[token_id * C + c]);
+        float4 *wte_vec = (float4*)(&wte[token_ids[threadIdx.y] * C + c]);
         float4 *wpe_vec = (float4*)(&wpe[t * C + c]);
 
         float4 wte_val = *wte_vec;
@@ -164,11 +167,11 @@ void encoder_forward(float *out,
                     int *inp, float *wte, float *wpe,
                     int B, int T, int C) {
     int blockDim_z = 1;
-    int blockDim_y = 16;
+    int blockDim_y = ENCODER_BLOCK_DIM_Y;
     int blockDim_x = 32;
     int gridDim_z = CEIL_DIV(B, blockDim_z);
     int gridDim_y = CEIL_DIV(T, blockDim_y);
-    int gridDim_x = CEIL_DIV(C, blockDim_x);
+    int gridDim_x = CEIL_DIV(C / 4, blockDim_x);
     dim3 blockDim = dim3(blockDim_x, blockDim_y, blockDim_z);
     dim3 gridDim = dim3(gridDim_x, gridDim_y, gridDim_z);
     encoder_forward_kernel<<<gridDim, blockDim>>>(out, inp, wte, wpe, B, T, C);
