@@ -273,10 +273,15 @@ __global__ void matmul_forward_kernel(float *out,
     int K = C;
     int N = OC;
 
-    int row_start = blockIdx.y * TS;
-    int col_start = blockIdx.x * TS;
+    int tid = threadIdx.y * blockDim.x + threadIdx.x; // exact thread within a block 0 - 127
 
-    if (row_start >= M || col_start >= N) return;
+    __shared__ half inp_s[TS * 2][TS];
+    __shared__ half weight_s[TS][TS * 2];
+
+    int block_row_start = blockIdx.y * 32;
+    int block_col_start = blockIdx.x * 32;
+
+    if (block_row_start >= M || block_col_start >= N) return;
 
     wmma::fragment<wmma::matrix_a, TS, TS, TS, half, wmma::row_major> a_frag;
     wmma::fragment<wmma::matrix_b, TS, TS, TS, half, wmma::col_major> b_frag;
@@ -285,25 +290,72 @@ __global__ void matmul_forward_kernel(float *out,
     wmma::fill_fragment(c_frag, 0.0f);
 
     for (int k = 0; k < K; k += TS) {
-        half *a_ptr = inp + (row_start * K) + k;
-        half *b_ptr = weight + (col_start * K) + k;
+        // load into shared memory.
+        for (int i = 0; i < 4; i++) {
+            int load_idx = tid + (i * 128);
+            int r = load_idx / 16;
+            int c = load_idx % 16;
 
-        wmma::load_matrix_sync(a_frag, a_ptr, K);
-        wmma::load_matrix_sync(b_frag, b_ptr, K);
+            int global_row_a = block_row_start + r;
+            int global_col_a = k + c;
+
+            if (global_row_a < M && global_col_a < K) {
+                inp_s[r][c] = inp[global_row_a * K + global_col_a];
+            } else {
+                inp_s[r][c] = 0.0f; // Pad with zero
+            }
+        }
+
+        for (int i = 0; i < 4; i++) {
+            int load_idx = tid + (i * 128);
+            int r = load_idx / 32; // K dimension
+            int c = load_idx % 32; // N dimension
+
+            int global_k = k + c; 
+            int global_n = block_col_start + r;
+
+            if (global_k < K && global_n < N) {
+                weight_s[r][c] = weight[global_n * K + global_k];
+            } else {
+                weight_s[r][c] = 0.0f; // Pad with zero
+            }
+        }
+        __syncthreads();
+
+        // point to the start
+        half *a_ptr = &inp_s[(threadIdx.y / 2) * 16][0];
+        half *b_ptr = &weight_s[0][(threadIdx.y % 2) * 16];
+
+        wmma::load_matrix_sync(a_frag, a_ptr, 16);
+        wmma::load_matrix_sync(b_frag, b_ptr, 32);
 
         wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+
+        __syncthreads();
     }
 
-    float *c_ptr = out + (row_start * N) + col_start;
-    wmma::store_matrix_sync(c_ptr, c_frag, N, wmma::mem_row_major);
+    int warp_row_local = (threadIdx.y / 2) * 16;
+    int warp_col_local = (threadIdx.y % 2) * 16;
 
-    int lane = threadIdx.x;
-    for (int i = 0; i < TS*TS; i += 32) {
-        int element_idx = i + lane;
-        int local_row = element_idx / TS;
-        int local_col = element_idx % TS;
+    int global_warp_row = block_row_start + warp_row_local;
+    int global_warp_col = block_col_start + warp_col_local;
 
-        c_ptr[local_row * N + local_col] += bias[col_start + local_col];
+    if (global_warp_row < M && global_warp_col < N) {
+        float *c_ptr = out + (global_warp_row * N) + global_warp_col;
+        wmma::store_matrix_sync(c_ptr, c_frag, N, wmma::mem_row_major);
+
+        for (int i = 0; i < TS*TS; i+=32) {
+            int element_idx = i + threadIdx.x;
+            int r = element_idx / TS;
+            int c = element_idx % TS;
+
+            int cur_row = global_warp_row + r;
+            int cur_col = global_warp_col + c;
+
+            if (cur_row < M && cur_col < N) {
+                c_ptr[r * N + c] += bias[cur_col];
+            }
+        }
     }
 }
 
@@ -355,8 +407,8 @@ void matmul_forward(float *out, half* qkvi, half* qkvw,
     // K is C
     int N = OC;
 
-    dim3 gridDim(CEIL_DIV(N, 16), CEIL_DIV(M, 16), 1);
-    dim3 blockDim(32, 1, 1); // Exactly 1 warp per block
+    dim3 gridDim(CEIL_DIV(N, 32), CEIL_DIV(M, 32), 1);
+    dim3 blockDim(32, 4, 1); // 4 warps per block
 
     matmul_forward_kernel<<<gridDim, blockDim>>>(
         out, qkvi, qkvw, bias, B, T, C, OC);
