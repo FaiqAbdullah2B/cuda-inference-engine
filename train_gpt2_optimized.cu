@@ -37,7 +37,7 @@ typedef struct {
     float *lnfb;        // final normalization's biases
 } ParameterTensors;
 
-#define NUM_ACTIVATION_TENSORS 17
+#define NUM_ACTIVATION_TENSORS 16
 typedef struct {
     float *encoded; // output of encoding
     float *ln1;     // output of first layer normalization
@@ -121,6 +121,58 @@ void init_activation_sizes(size_t *act_sizes, int B, int T, GPT2Config config) {
     act_sizes[13] = B * T * C; // lnf
     act_sizes[14] = B * T * Vp; // logits
     act_sizes[15] = B * T * Vp; // probs
+}
+
+// kernels
+__global__ void encoder_forward_kernel(float *out,
+                                       int *inp, float *wte, float *wpe,
+                                       int B, int T, int C) {
+    int b = blockIdx.z * blockDim.z + threadIdx.z; // depth
+    int t = blockIdx.y * blockDim.y + threadIdx.y; // row
+    int c = (blockIdx.x * blockDim.x + threadIdx.x) * 4; // col
+
+    __shared__ int token_id;
+
+    if (b >= 0 && b < B && t >= 0 && t < T && c >= 0 && c < C) {
+        if (threadIdx.x == 0)
+            token_id = inp[b * T + t];
+    }
+    __syncthreads();
+    
+    if (b >= 0 && b < B && t >= 0 && t < T && c >= 0 && c < C) {
+        // using float4 to reduce 12 accesses per 4 values to just 3 accesses
+        float4 *wte_vec = (float4*)(&wte[token_id * C + c]);
+        float4 *wpe_vec = (float4*)(&wpe[t * C + c]);
+
+        float4 wte_val = *wte_vec;
+        float4 wpe_val = *wpe_vec;
+        float4 out_val;
+        
+        // add position encoding to token embeddings
+        out_val.x = wte_val.x + wpe_val.x; // first val
+        out_val.y = wte_val.y + wpe_val.y;
+        out_val.z = wte_val.z + wpe_val.z;
+        out_val.w = wte_val.w + wpe_val.w; 
+
+        // store
+        *((float4 *)(&out[b * T * C + t * C + c])) = out_val;
+    }
+}
+
+// kernel launchers
+void encoder_forward(float *out,
+                    int *inp, float *wte, float *wpe,
+                    int B, int T, int C) {
+    int blockDim_z = 1;
+    int blockDim_y = 16;
+    int blockDim_x = 32;
+    int gridDim_z = CEIL_DIV(B, blockDim_z);
+    int gridDim_y = CEIL_DIV(T, blockDim_y);
+    int gridDim_x = CEIL_DIV(C, blockDim_x);
+    dim3 blockDim = dim3(blockDim_x, blockDim_y, blockDim_z);
+    dim3 gridDim = dim3(gridDim_x, gridDim_y, gridDim_z);
+    encoder_forward_kernel<<<gridDim, blockDim>>>(out, inp, wte, wpe, B, T, C);
+    cudaCheck(cudaGetLastError());
 }
 
 float *malloc_and_point_parameters(ParameterTensors* params, 
@@ -273,13 +325,12 @@ void gpt2_forward(GPT2 *model, int *inputs, int *targets, int B, int T) {
         model->num_activations = num_activations;
         model->acts_memory = malloc_and_point_activations(
             &model->acts, model->act_sizes);
-        // printf("allocated %ld MiB for activations\n", 
-        //     (num_activations * sizeof(float)) >> 20);
+        printf("allocated %ld MiB for activations\n", 
+            (num_activations * sizeof(float)) >> 20);
         
         // also create memory for caching inputs and targets
         cudaCheck(cudaMalloc((void**)&model->inputs, B * T * sizeof(int)));
         cudaCheck(cudaMalloc((void**)&model->targets, B * T * sizeof(int)));
-        // cudaCheck(cudaMallocHost((void**)&model->cpu_losses, B * T * sizeof(float)));
     }
     else {
         if (B != model->batch_size || T != model->seq_len) {
@@ -304,6 +355,8 @@ void gpt2_forward(GPT2 *model, int *inputs, int *targets, int B, int T) {
     ParameterTensors params = model->params;
     ActivationTensors acts = model->acts;
     float *residual;
+
+    encoder_forward(acts.encoded, model->inputs, params.wte, params.wpe, B, T, C);
 }
 
 void generate_text(GPT2 *model, Tokenizer *tokenizer, int *prompt_tokens, int B, int T, int max_new_tokens) {
@@ -363,40 +416,19 @@ int main() {
     GPT2 model;
     gpt2_build_from_checkpoint(&model, "../gpt2_124M.bin");
 
+    const char* tiny_shake_train = "../dev/data/tinyshakespeare/tiny_shakespeare_train.bin";
+    int B = 24;
+    int T = 256;
+    Dataloader train_loader;
+    dataloader_init(&train_loader, tiny_shake_train, B, T);
+
     Tokenizer tokenizer;
     tokenizer_init(&tokenizer, "../gpt2_tokenizer.bin");
 
-    int B = 1;          
-    int T = 128;
-    
-    const char* tiny_shake_train = "../dev/data/tinyshakespeare/tiny_shakespeare_train.bin";
-    Dataloader train_loader;
-    dataloader_init(&train_loader, tiny_shake_train, B, T);
-    
-    // Fetch a batch to use as prompt
     dataloader_next_batch(&train_loader);
-    dataloader_next_batch(&train_loader);
-    dataloader_next_batch(&train_loader);
-    dataloader_next_batch(&train_loader);
-
-    printf("--- PROMPT ---\n");
-    for (int i = 0; i < B * T; i++) {
-        printf("%s", tokenizer_decode(&tokenizer, train_loader.inputs[i])); 
-    }
-    printf("\n--- GENERATION ---\n");
-
-    // Seed the random number generator
-    srand(time(NULL));
-
-    int max_new_tokens = 100;
-
-    generate_text(&model, &tokenizer, train_loader.inputs, B, T, max_new_tokens);
-
-    printf("\n------------------\n");
+    gpt2_forward(&model, train_loader.inputs, train_loader.targets, B, T);
 
     dataloader_free(&train_loader);
     tokenizer_free(&tokenizer);
     gpt2_free(&model);
-    
-    return 0;
 }
