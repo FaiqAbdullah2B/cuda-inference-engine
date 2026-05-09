@@ -257,29 +257,10 @@ __global__ void layernorm_forward_kernel(float *out, float *inp,
     }
 }
 
-// __global__ void matmul_forward_kernel(float *out,
-//                                       float *inp, float *weight, float *bias,
-//                                       int B, int T, int C, int OC) {
-//     int b = blockIdx.z * blockDim.z + threadIdx.z;
-//     int t = blockIdx.y * blockDim.y + threadIdx.y;
-//     int o = blockIdx.x * blockDim.x + threadIdx.x;
-
-//     if (b >= 0 && b < B && t >= 0 && t < T && o >= 0 && o < OC) {
-//         int outIdx = b * T * OC + t * OC + o;
-//         int inpStartIdx = b * T * C + t * C;
-//         float val = (bias != NULL) ? bias[o] : 0.0f;
-//         float *wrow = weight + o*C;
-//         for (int i = 0; i < C; i++) {
-//             val += inp[inpStartIdx + i] * wrow[i];
-//         }
-//         out[outIdx] = val;
-//     }
-// }
-
 __global__ void float_to_half_kernel(half* out, const float* in, int size) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < size) {
-        out[idx] = __float2half(in[idx]); // Actual hardware conversion
+        out[idx] = __float2half(in[idx]); // Hardware conversion
     }
 }
 
