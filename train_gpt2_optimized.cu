@@ -264,6 +264,7 @@ __global__ void float_to_half_kernel(half* out, const float* in, int size) {
     }
 }
 
+// UNDERSTAND THIS or revert this
 #define TS 16
 // M x K * K x N Matmul
 __global__ void matmul_forward_kernel(float *out,
@@ -289,6 +290,7 @@ __global__ void matmul_forward_kernel(float *out,
 
     wmma::fill_fragment(c_frag, 0.0f);
 
+    // input is M x K
     for (int k = 0; k < K; k += TS) {
         // load into shared memory.
         for (int i = 0; i < 4; i++) {
@@ -306,13 +308,15 @@ __global__ void matmul_forward_kernel(float *out,
             }
         }
 
+        // weight is N x K not K x N, so each column is K elements long
         for (int i = 0; i < 4; i++) {
             int load_idx = tid + (i * 128);
             int r = load_idx / 32; // K dimension
             int c = load_idx % 32; // N dimension
 
             int global_k = k + c; 
-            int global_n = block_col_start + r;
+            // block col start is quite confusing for this.
+            int global_n = block_col_start + r; // starting N + r
 
             if (global_k < K && global_n < N) {
                 weight_s[r][c] = weight[global_n * K + global_k];
@@ -358,6 +362,60 @@ __global__ void matmul_forward_kernel(float *out,
         }
     }
 }
+
+__global__ void residual_forward_kernel(float *out, float *inp1, float *inp2, int N) {
+    int i = (blockIdx.x * blockDim.x + threadIdx.x) * 4;
+    if (i >= 0 && i < N - 4) {
+        float4 inp1_val = *(float4 *)(&inp1[i]);
+        float4 inp2_val = *(float4 *)(&inp2[i]);
+
+        inp1_val.x = inp1_val.x + inp2_val.x;
+        inp1_val.y = inp1_val.y + inp2_val.y;
+        inp1_val.z = inp1_val.z + inp2_val.z;
+        inp1_val.w = inp1_val.w + inp2_val.w;
+        
+        *(float4 *)(&out[i]) = inp1_val;
+    }
+
+    // if N is not divisble by 4
+    if (i == N - (N % 4)) {
+        for (int j = 0; j < (N % 4); ++j) {
+            out[i + j] = inp1[i + j] + inp2[i + j];
+        }
+    }
+}
+
+#define M_PI 3.14159265358979323846 // math.h won't help...
+#define GELU_SCALING_FACTOR sqrtf(2.0f / M_PI)
+__global__ void gelu_forward_kernel(float *out, float *inp, int N) {
+    int i = (blockIdx.x * blockDim.x + threadIdx.x) * 4;
+    if (i >= 0 && i < N - 4) {
+        float4 inp_val = *(float4 *)(&inp[i]);
+        float4 cube;
+        cube.x = 0.044715f * inp_val.x * inp_val.x * inp_val.x;
+        cube.y = 0.044715f * inp_val.y * inp_val.y * inp_val.y;
+        cube.z = 0.044715f * inp_val.z * inp_val.z * inp_val.z;
+        cube.w = 0.044715f * inp_val.w * inp_val.w * inp_val.w;
+
+        cube.x = 0.5f * inp_val.x * (1.0f + tanhf(GELU_SCALING_FACTOR * (inp_val.x + cube.x)));
+        cube.y = 0.5f * inp_val.y * (1.0f + tanhf(GELU_SCALING_FACTOR * (inp_val.y + cube.y)));
+        cube.z = 0.5f * inp_val.z * (1.0f + tanhf(GELU_SCALING_FACTOR * (inp_val.z + cube.z)));
+        cube.w = 0.5f * inp_val.w * (1.0f + tanhf(GELU_SCALING_FACTOR * (inp_val.w + cube.w)));
+
+        *(float4 *)(&out[i]) = cube;
+    }
+
+    // if N is not divisble by 4
+    if (i == N - (N % 4)) {
+        for (int j = 0; j < (N % 4); ++j) {
+            float x = inp[i + j];
+            float cube = 0.044715f * x * x * x;
+            cube = 0.5f * x * (1.0f + tanhf(GELU_SCALING_FACTOR * (x + cube)));
+            out[i + j] = cube;
+        }
+    }
+}
+
 
 // kernel launchers
 void encoder_forward(float *out,
@@ -412,6 +470,14 @@ void matmul_forward(float *out, half* qkvi, half* qkvw,
 
     matmul_forward_kernel<<<gridDim, blockDim>>>(
         out, qkvi, qkvw, bias, B, T, C, OC);
+}
+
+void residual_forward(float *out, float *inp1, float *inp2, int N) {
+    int blockDim_x = 512;
+    int gridDim_x = CEIL_DIV(N, blockDim_x);
+    dim3 gridDim(gridDim_x, 1, 1);
+    dim3 blockDim(blockDim_x, 1, 1);
+    residual_forward_kernel(out, inp1, inp2, N);
 }
 
 float *malloc_and_point_parameters(ParameterTensors* params, 
