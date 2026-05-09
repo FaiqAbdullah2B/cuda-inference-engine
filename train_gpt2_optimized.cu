@@ -6,6 +6,9 @@ extern "C" {
 #include "./llmc/rand.h"
 #include "./dev/cuda/utils.h"
 #include <math.h>
+#include <mma.h>
+
+using namespace nvcuda;
 
 typedef struct {
     int max_seq_len; // max sequence length
@@ -57,6 +60,12 @@ typedef struct {
     float *probs; // (B, T, V)
 } ActivationTensors;
 
+#define NUM_HALF_TENSORS 2
+typedef struct {
+    half *qkvi;
+    half *qkvw;
+} HalfTensors;
+
 typedef struct {
     GPT2Config config;
     // parameters
@@ -69,6 +78,11 @@ typedef struct {
     size_t act_sizes[NUM_ACTIVATION_TENSORS];
     float *acts_memory;
     size_t num_activations;
+    // halfs
+    HalfTensors halfs;
+    size_t half_sizes[NUM_HALF_TENSORS];
+    half *halfs_memory;
+    size_t num_halfs;
 
     int batch_size; // B
     int seq_len; // T
@@ -121,6 +135,13 @@ void init_activation_sizes(size_t *act_sizes, int B, int T, GPT2Config config) {
     act_sizes[13] = B * T * C; // lnf
     act_sizes[14] = B * T * Vp; // logits
     act_sizes[15] = B * T * Vp; // probs
+}
+
+void init_half_sizes(size_t *half_sizes, int B, int T, GPT2Config config) {
+    size_t L = config.num_layers;
+    size_t C = config.channels;
+    half_sizes[0] = L * B * T * C;      // layernorm 1 (qkvi)
+    half_sizes[1] = L * (3 * C) * C;    // qkvw
 }
 
 // kernels
@@ -236,6 +257,75 @@ __global__ void layernorm_forward_kernel(float *out, float *inp,
     }
 }
 
+// __global__ void matmul_forward_kernel(float *out,
+//                                       float *inp, float *weight, float *bias,
+//                                       int B, int T, int C, int OC) {
+//     int b = blockIdx.z * blockDim.z + threadIdx.z;
+//     int t = blockIdx.y * blockDim.y + threadIdx.y;
+//     int o = blockIdx.x * blockDim.x + threadIdx.x;
+
+//     if (b >= 0 && b < B && t >= 0 && t < T && o >= 0 && o < OC) {
+//         int outIdx = b * T * OC + t * OC + o;
+//         int inpStartIdx = b * T * C + t * C;
+//         float val = (bias != NULL) ? bias[o] : 0.0f;
+//         float *wrow = weight + o*C;
+//         for (int i = 0; i < C; i++) {
+//             val += inp[inpStartIdx + i] * wrow[i];
+//         }
+//         out[outIdx] = val;
+//     }
+// }
+
+__global__ void float_to_half_kernel(half* out, const float* in, int size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        out[idx] = __float2half(in[idx]); // Actual hardware conversion
+    }
+}
+
+#define TS 16
+// M x K * K x N Matmul
+__global__ void matmul_forward_kernel(float *out,
+                                      half *inp, half *weight, float *bias,
+                                      int B, int T, int C, int OC) {
+    int M = B * T;
+    int K = C;
+    int N = OC;
+
+    int row_start = blockIdx.y * TS;
+    int col_start = blockIdx.x * TS;
+
+    if (row_start >= M || col_start >= N) return;
+
+    wmma::fragment<wmma::matrix_a, TS, TS, TS, half, wmma::row_major> a_frag;
+    wmma::fragment<wmma::matrix_b, TS, TS, TS, half, wmma::col_major> b_frag;
+    wmma::fragment<wmma::accumulator, TS, TS, TS, float> c_frag;
+
+    wmma::fill_fragment(c_frag, 0.0f);
+
+    for (int k = 0; k < K; k += TS) {
+        half *a_ptr = inp + (row_start * K) + k;
+        half *b_ptr = weight + (col_start * K) + k;
+
+        wmma::load_matrix_sync(a_frag, a_ptr, K);
+        wmma::load_matrix_sync(b_frag, b_ptr, K);
+
+        wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+    }
+
+    float *c_ptr = out + (row_start * N) + col_start;
+    wmma::store_matrix_sync(c_ptr, c_frag, N, wmma::mem_row_major);
+
+    int lane = threadIdx.x;
+    for (int i = 0; i < TS*TS; i += 32) {
+        int element_idx = i + lane;
+        int local_row = element_idx / TS;
+        int local_col = element_idx % TS;
+
+        c_ptr[local_row * N + local_col] += bias[col_start + local_col];
+    }
+}
+
 // kernel launchers
 void encoder_forward(float *out,
                     int *inp, float *wte, float *wpe,
@@ -267,6 +357,28 @@ void layernorm_forward(float *out, float *inp, float *weight,
     layernorm_forward_kernel<<<gridDim, blockDim>>>(
         out, inp, weight, bias, B, T, C);
     cudaCheck(cudaGetLastError());
+}
+
+void matmul_forward(float *out, half* qkvi, half* qkvw,
+                    float *inp, float *weight, float *bias,
+                    int B, int T, int C, int OC) {
+    dim3 gridDim_inp(CEIL_DIV(B * T * C, 512), 1, 1);
+    dim3 blockDim_fth(512, 1, 1);
+    float_to_half_kernel<<<gridDim_inp, blockDim_fth>>>(qkvi, inp, B * T * C);
+
+    int weight_elements = OC * C;
+    dim3 gridDim_wt(CEIL_DIV(weight_elements, 512), 1, 1);
+    float_to_half_kernel<<<gridDim_wt, blockDim_fth>>>(qkvw, weight, weight_elements);
+
+    int M = B * T;
+    // K is C
+    int N = OC;
+
+    dim3 gridDim(CEIL_DIV(N, 16), CEIL_DIV(M, 16), 1);
+    dim3 blockDim(32, 1, 1); // Exactly 1 warp per block
+
+    matmul_forward_kernel<<<gridDim, blockDim>>>(
+        out, qkvi, qkvw, bias, B, T, C, OC);
 }
 
 float *malloc_and_point_parameters(ParameterTensors* params, 
@@ -327,6 +439,29 @@ float* malloc_and_point_activations(ActivationTensors* acts, const size_t* act_s
         &acts->logits, &acts->probs
     };
     return malloc_and_point(ptrs, act_sizes, NUM_ACTIVATION_TENSORS);
+}
+
+half* malloc_and_point_halfs(HalfTensors* halfs, const size_t* half_sizes) {
+    size_t num_halfs = 0;
+    for (size_t i = 0; i < NUM_HALF_TENSORS; i++) {
+        num_halfs += half_sizes[i];
+    }
+
+    half *halfs_memory;
+    cudaCheck(
+        cudaMalloc((void **)&halfs_memory, num_halfs * sizeof(half))
+    );
+
+    half **ptrs[] = {
+        &halfs->qkvi, &halfs->qkvw
+    };
+
+    half *halfs_memory_iterator = halfs_memory;
+    for (size_t i = 0; i < NUM_HALF_TENSORS; i++) {
+        *(ptrs[i]) = halfs_memory_iterator;
+        halfs_memory_iterator += half_sizes[i];
+    }
+    return halfs_memory;
 }
 
 void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
@@ -405,6 +540,13 @@ void gpt2_forward(GPT2 *model, int *inputs, int *targets, int B, int T) {
         }
     }
 
+    if (model->halfs_memory != NULL) {
+        if (B != model->batch_size || T != model->seq_len) {
+            cudaFree(model->halfs_memory);
+            model->halfs_memory = NULL;
+        }
+    }
+
     if (model->acts_memory == NULL) {
         model->batch_size = B;
         model->seq_len = T;
@@ -433,6 +575,27 @@ void gpt2_forward(GPT2 *model, int *inputs, int *targets, int B, int T) {
         }
     }
 
+    if (model->halfs_memory == NULL) {
+        init_half_sizes(model->half_sizes, B, T, model->config);
+
+        size_t num_halfs = 0;
+        for (size_t i = 0; i < NUM_HALF_TENSORS; i++) {
+            num_halfs += model->half_sizes[i];
+        }
+
+        model->num_halfs = num_halfs;
+        model->halfs_memory = malloc_and_point_halfs(
+            &model->halfs, model->half_sizes);
+        printf("allocated %ld MiB for halfs\n", 
+            (num_halfs * sizeof(half)) >> 20);
+    }
+    else {
+        if (B != model->batch_size || T != model->seq_len) {
+            printf("Model: B=%d T=%d, Desired: B=%d T=%d\n", model->batch_size, model->seq_len, B, T);
+            exit(EXIT_FAILURE);
+        }
+    }
+
     cudaCheck(
         cudaMemcpy(model->inputs, inputs, 
                    B * T * sizeof(int), 
@@ -448,10 +611,57 @@ void gpt2_forward(GPT2 *model, int *inputs, int *targets, int B, int T) {
 
     ParameterTensors params = model->params;
     ActivationTensors acts = model->acts;
+    HalfTensors halfs = model->halfs;
     float *residual;
+    float *intermediate = (float *)malloc(B * T * 4 * C * sizeof(float));
+
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+
+    cudaEventRecord(start);
     encoder_forward(acts.encoded, model->inputs, params.wte, params.wpe, B, T, C);
-    
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+
+    float milliseconds = 0.0f;
+
+    cudaEventElapsedTime(&milliseconds, start, stop);
+    printf("Encoder time taken: %f ms\n", milliseconds);
+
+    cudaEventRecord(start);
     layernorm_forward(acts.ln1, acts.encoded, params.ln1w, params.ln1b, B, T, C);
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+
+    milliseconds = 0.0f;
+
+    cudaEventElapsedTime(&milliseconds, start, stop);
+    printf("Layernorm time taken: %f ms\n", milliseconds);
+
+    cudaEventRecord(start);
+    matmul_forward(acts.qkv, halfs.qkvi, halfs.qkvw, acts.ln1, params.qkvw, params.qkvb, B, T, C, 3 * C);
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+
+    milliseconds = 0.0f;
+
+    cudaEventElapsedTime(&milliseconds, start, stop);
+    printf("QKV time taken: %f ms\n", milliseconds);
+
+    cudaMemcpy(intermediate, acts.qkv, B * T * C * sizeof(float), cudaMemcpyDeviceToHost);
+
+    printf("=================== QKV output ==================\n");
+    for (int i = 0; i < B * T; i++) {
+        printf("%f ", intermediate[i]);
+        if ((i + 1) % 100 == 0) {
+            printf("\n");
+        }
+    }
+    printf("\n");
+
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
 }
 
 void generate_text(GPT2 *model, Tokenizer *tokenizer, int *prompt_tokens, int B, int T, int max_new_tokens) {
@@ -512,8 +722,8 @@ int main() {
     gpt2_build_from_checkpoint(&model, "../gpt2_124M.bin");
 
     const char* tiny_shake_train = "../dev/data/tinyshakespeare/tiny_shakespeare_train.bin";
-    int B = 4;
-    int T = 64;
+    int B = 24;
+    int T = 256;
     Dataloader train_loader;
     dataloader_init(&train_loader, tiny_shake_train, B, T);
 
