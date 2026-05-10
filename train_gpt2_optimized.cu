@@ -153,6 +153,7 @@ __global__ void encoder_forward_kernel(float *out,
     int t = blockIdx.y * blockDim.y + threadIdx.y; // row
     int c = (blockIdx.x * blockDim.x + threadIdx.x) * 4; // col
 
+    // shared memory because every single c will access the same token id
     __shared__ int token_ids[ENCODER_BLOCK_DIM_Y];
 
     if (b >= 0 && b < B && t >= 0 && t < T && c >= 0 && c < C) {
@@ -365,7 +366,7 @@ __global__ void matmul_forward_kernel(float *out,
 
 __global__ void residual_forward_kernel(float *out, float *inp1, float *inp2, int N) {
     int i = (blockIdx.x * blockDim.x + threadIdx.x) * 4;
-    if (i >= 0 && i < N - 4) {
+    if (i >= 0 && i <= N - 4) {
         float4 inp1_val = *(float4 *)(&inp1[i]);
         float4 inp2_val = *(float4 *)(&inp2[i]);
 
@@ -389,7 +390,7 @@ __global__ void residual_forward_kernel(float *out, float *inp1, float *inp2, in
 #define GELU_SCALING_FACTOR sqrtf(2.0f / M_PI)
 __global__ void gelu_forward_kernel(float *out, float *inp, int N) {
     int i = (blockIdx.x * blockDim.x + threadIdx.x) * 4;
-    if (i >= 0 && i < N - 4) {
+    if (i >= 0 && i <= N - 4) {
         float4 inp_val = *(float4 *)(&inp[i]);
         float4 cube;
         cube.x = 0.044715f * inp_val.x * inp_val.x * inp_val.x;
@@ -416,6 +417,130 @@ __global__ void gelu_forward_kernel(float *out, float *inp, int N) {
     }
 }
 
+__device__ float reduction_max(float val, float *input_s) {
+    int tx = threadIdx.x;
+
+    input_s[tx] = val;
+    __syncthreads();
+
+    for (unsigned int stride = blockDim.x/2; stride >= 1; stride /= 2) {
+        if (threadIdx.x < stride) {
+            // hardware accelerated instruction for max. Intrinsic.
+            input_s[tx] = fmaxf(input_s[tx], input_s[tx + stride]);
+        }
+        __syncthreads();
+    }
+
+    return input_s[0];
+}
+
+// probs <- softmax(logits)
+#define TEMPERATURE 0.75f
+__global__ void softmax_forward_kernel(float *probs, float *logits, 
+                                       int B, int T, int V, int Vp) {
+    int row_idx = blockIdx.x; // One block processes one row
+
+    if (row_idx >= B * T) return;
+    
+    // shared mem to perform reduction max on
+    __shared__ float max_s[1024];
+
+    // max specific to this thread
+    float thread_max = -1e20f;
+
+    // Calculate Max
+    // 1024 threads * 4 = 4096 elements processed per loop iteration
+    for (int i = threadIdx.x * 4; i < V; i += blockDim.x * 4) {
+        if (i <= Vp - 4) {
+            float4 logits_val = *(float4 *)&logits[row_idx * Vp + i];
+            // maxval is only calculated and subtracted for numerical stability
+            logits_val.x /= TEMPERATURE;
+            logits_val.y /= TEMPERATURE;
+            logits_val.z /= TEMPERATURE;
+            logits_val.w /= TEMPERATURE;
+
+            float local_max = fmax(logits_val.x, logits_val.y);
+            local_max = fmax(local_max, logits_val.z);
+            local_max = fmax(local_max, logits_val.w);
+
+            thread_max = fmaxf(local_max, thread_max);
+        }
+        else {
+            for (int j = 0; j < V - i; j++) {
+                float val = logits[row_idx * Vp + i + j] / TEMPERATURE;
+                thread_max = fmaxf(thread_max, val);
+            }
+
+        }
+    }
+
+    float maxval = reduction_max(thread_max, max_s);
+
+    // Sum the exps for the denominator
+    float thread_sum = 0.0f;
+    for (int i = threadIdx.x * 4; i < V; i += blockDim.x * 4) {
+        if (i <= V - 4) {
+            // pray that its in cache and go for another global mem access
+            float4 logits_val = *(float4 *)&logits[row_idx * Vp + i];
+
+            logits_val.x /= TEMPERATURE;
+            logits_val.y /= TEMPERATURE;
+            logits_val.z /= TEMPERATURE;
+            logits_val.w /= TEMPERATURE;
+
+            float local_sum = 0.0f;
+            local_sum += expf(logits_val.x - maxval);
+            local_sum += expf(logits_val.y - maxval);
+            local_sum += expf(logits_val.z - maxval);
+            local_sum += expf(logits_val.w - maxval);
+
+            thread_sum += local_sum;
+        }
+        else {
+            for (int j = 0; j < V - i; ++j) {
+                float val = logits[row_idx * Vp + i + j] / TEMPERATURE;
+                thread_sum += expf(val - maxval);
+            }
+        }
+    }
+
+    // recycling max shared mem to save resources
+    float sum = reduction_sum(thread_sum, max_s);
+
+    // Normalize and store
+    for (int i = threadIdx.x * 4; i < V; i += blockDim.x * 4) {
+        if (i <= V - 4) {
+            float4 val = *(float4 *)&logits[row_idx * Vp + i];
+
+            val.x /= TEMPERATURE;
+            val.y /= TEMPERATURE;
+            val.z /= TEMPERATURE;
+            val.w /= TEMPERATURE;
+
+            // Calculate the final probability for all 4 floats
+            float4 probs_val;
+            probs_val.x = expf(val.x - maxval) / sum;
+            probs_val.y = expf(val.y - maxval) / sum;
+            probs_val.z = expf(val.z - maxval) / sum;
+            probs_val.w = expf(val.w - maxval) / sum;
+
+            // Vectorized Write to Global Memory
+            *(float4 *)&probs[row_idx * Vp + i] = probs_val;
+        }
+        else {
+            // Scalar cleanup for the last 1, 2, or 3 elements
+            for (int j = 0; j < V - i; ++j) {
+                float val = logits[row_idx * Vp + i + j] / TEMPERATURE;
+                probs[row_idx * Vp + i + j] = expf(val - maxval) / sum;
+            }
+        }
+    }
+
+    // Padding
+    for (int i = V + threadIdx.x; i < Vp; i += blockDim.x) {
+        probs[row_idx * Vp + i] = 0.0f;
+    }
+}
 
 // kernel launchers
 void encoder_forward(float *out,
@@ -426,7 +551,7 @@ void encoder_forward(float *out,
     int blockDim_x = 32;
     int gridDim_z = CEIL_DIV(B, blockDim_z);
     int gridDim_y = CEIL_DIV(T, blockDim_y);
-    int gridDim_x = CEIL_DIV(C / 4, blockDim_x);
+    int gridDim_x = CEIL_DIV(C, blockDim_x * 4);
     dim3 blockDim = dim3(blockDim_x, blockDim_y, blockDim_z);
     dim3 gridDim = dim3(gridDim_x, gridDim_y, gridDim_z);
     encoder_forward_kernel<<<gridDim, blockDim>>>(out, inp, wte, wpe, B, T, C);
@@ -456,10 +581,13 @@ void matmul_forward(float *out, half* qkvi, half* qkvw,
     dim3 gridDim_inp(CEIL_DIV(B * T * C, 512), 1, 1);
     dim3 blockDim_fth(512, 1, 1);
     float_to_half_kernel<<<gridDim_inp, blockDim_fth>>>(qkvi, inp, B * T * C);
+    cudaCheck(cudaGetLastError());
 
     int weight_elements = OC * C;
     dim3 gridDim_wt(CEIL_DIV(weight_elements, 512), 1, 1);
     float_to_half_kernel<<<gridDim_wt, blockDim_fth>>>(qkvw, weight, weight_elements);
+    cudaCheck(cudaGetLastError());
+
 
     int M = B * T;
     // K is C
@@ -470,14 +598,37 @@ void matmul_forward(float *out, half* qkvi, half* qkvw,
 
     matmul_forward_kernel<<<gridDim, blockDim>>>(
         out, qkvi, qkvw, bias, B, T, C, OC);
+    cudaCheck(cudaGetLastError());
+
 }
 
 void residual_forward(float *out, float *inp1, float *inp2, int N) {
     int blockDim_x = 512;
-    int gridDim_x = CEIL_DIV(N, blockDim_x);
+    int gridDim_x = CEIL_DIV(N, blockDim_x * 4);
     dim3 gridDim(gridDim_x, 1, 1);
     dim3 blockDim(blockDim_x, 1, 1);
-    residual_forward_kernel(out, inp1, inp2, N);
+    residual_forward_kernel<<<gridDim, blockDim>>>(out, inp1, inp2, N);
+    cudaCheck(cudaGetLastError());
+}
+
+void gelu_forward(float *out, float *inp, int N) {
+    int blockDim_x = 512;
+    int gridDim_x = CEIL_DIV(N, blockDim_x * 4);
+    dim3 gridDim(gridDim_x, 1, 1);
+    dim3 blockDim(blockDim_x, 1, 1);
+    gelu_forward_kernel<<<gridDim, blockDim>>>(out, inp, N);
+    cudaCheck(cudaGetLastError());
+}
+
+void softmax_forward(float* probs, float* logits, 
+                    int B, int T, int V, int Vp) {
+    // Vp is 50304
+    int blockDim_x = 1024;
+    int gridDim_x = B * T; // one block handles the entire width
+    dim3 gridDim(gridDim_x, 1, 1);
+    dim3 blockDim(blockDim_x, 1, 1);
+    softmax_forward_kernel<<<gridDim, blockDim>>>(probs, logits, B, T, V, Vp);
+    cudaCheck(cudaGetLastError());
 }
 
 float *malloc_and_point_parameters(ParameterTensors* params, 
