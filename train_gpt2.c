@@ -4,6 +4,12 @@
 #include "./llmc/rand.h"
 #include <math.h>
 #include <string.h>
+#include <float.h>  
+#include <assert.h> 
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846f
+#endif
 
 typedef struct {
     int max_seq_len; // max sequence length
@@ -36,7 +42,7 @@ typedef struct {
     float* lnfb; // (C)
 } ParameterTensors;
 
-#define NUM_ACTIVATION_TENSORS 6
+#define NUM_ACTIVATION_TENSORS 15
 typedef struct {
     float *encoded; // (B, T, C) // output of encoding
     float *ln1;     // (L, B, T, C) // output of first layer normalization
@@ -88,6 +94,14 @@ void init_parameters_sizes(size_t *param_sizes, GPT2Config config) {
     param_sizes[5] = L * (3 * C);       // qkvb
     param_sizes[6] = L * C * C;         // attprojw
     param_sizes[7] = L * C;             // attprojb
+    param_sizes[8] = (size_t)L * C;           // ln2w
+    param_sizes[9] = (size_t)L * C;           // ln2b
+    param_sizes[10] = (size_t)L * 4 * C * C;  // fcw
+    param_sizes[11] = (size_t)L * 4 * C;      // fcb
+    param_sizes[12] = (size_t)L * C * 4 * C;  // fcprojw
+    param_sizes[13] = (size_t)L * C;          // fcprojb
+    param_sizes[14] = (size_t)C;              // lnfw
+    param_sizes[15] = (size_t)C;              // lnfb
 }
 
 // adds positional encoding and encoded token into an output
@@ -255,46 +269,84 @@ void gelu_forward(float *out, float *inp, int N) {
 }
 
 float *malloc_and_point_parameters(ParameterTensors *params, size_t *param_sizes) {
-    size_t num_params = 0;
-    for (size_t i = 0; i < NUM_PARAMETER_TENSORS; i++) {
-        num_params += param_sizes[i];
+    size_t total_elements = 0;
+    for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
+        total_elements += param_sizes[i];
     }
     
     // malloc all the parameters in one block of memory
-    float *params_memory = (float*)malloc(num_params * sizeof(float));
-
-    // assign all the tensors
-    float **ptrs[] = {
-        &params->wte, &params->wtp, &params->ln1w, &params->ln1b, 
-        &params->qkvw, &params->qkvb, &params->attprojw, &params->attprojb
-    };
-    
-    // set all the starting locations for pointers
-    float *params_memory_iterator = params_memory;
-    for (size_t i = 0; i < NUM_PARAMETER_TENSORS; i++) {
-        *(ptrs[i]) = params_memory_iterator;
-        params_memory_iterator += param_sizes[i];
+    float *params_memory = (float*)malloc(total_elements * sizeof(float));
+    if (params_memory == NULL) {
+        printf("ERROR: Failed to allocate parameters memory\n");
+        exit(1);
     }
+
+    // casting the activation tensor pointer to a float** for easier assignment
+    float **ptrs[NUM_PARAMETER_TENSORS] = {
+        &params->wte, 
+        &params->wpe, 
+        &params->ln1w, 
+        &params->ln1b, 
+        &params->qkvw, 
+        &params->qkvb, 
+        &params->attprojw, 
+        &params->attprojb, 
+        &params->ln2w, 
+        &params->ln2b, 
+        &params->fcw, 
+        &params->fcb, 
+        &params->fcprojw, 
+        &params->fcprojb, 
+        &params->lnfw, 
+        &params->lnfb
+    };
+
+    float *current_ptr = params_memory;
+    for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
+        *ptrs[i] = current_ptr;
+        current_ptr += param_sizes[i];
+    }
+
     return params_memory;
 }
 
 float *malloc_and_point_activations(ActivationTensors *acts, size_t *act_sizes) {
-    size_t num_activations = 0;
-    for (size_t i = 0; i < NUM_ACTIVATION_TENSORS; i++) {
-        num_activations += act_sizes[i];
+    // Calculate the total size
+    size_t total_elements = 0;
+    for (int i = 0; i < NUM_ACTIVATION_TENSORS; i++) {
+        total_elements += act_sizes[i];
     }
     
-    float *acts_memory = (float*)malloc(num_activations * sizeof(float));
-    float **ptrs[] = {
-        &acts->encoded, &acts->ln1, &acts->qkv, &acts->atty, 
-        &acts->preatt, &acts->att
+    float *acts_memory = (float*)malloc(total_elements * sizeof(float));
+    if (acts_memory == NULL) {
+        printf("ERROR: Failed to allocate activations memory\n");
+        exit(1);
+    }
+
+    float **ptrs[NUM_ACTIVATION_TENSORS] = {
+        &acts->encoded, 
+        &acts->ln1, 
+        &acts->qkv, 
+        &acts->atty, 
+        &acts->preatt, 
+        &acts->att, 
+        &acts->attproj, 
+        &acts->residual2, 
+        &acts->ln2, 
+        &acts->fch, 
+        &acts->fch_gelu, 
+        &acts->fcproj, 
+        &acts->residual3, 
+        &acts->lnf, 
+        &acts->logits
     };
 
-    float *acts_memory_iterator = acts_memory;
-    for (size_t i = 0; i < NUM_ACTIVATION_TENSORS; i++) {
-        *(ptrs[i]) = acts_memory_iterator;
-        acts_memory_iterator += act_sizes[i];
+    float *current_ptr = acts_memory;
+    for (int i = 0; i < NUM_ACTIVATION_TENSORS; i++) {
+        *ptrs[i] = current_ptr;
+        current_ptr += act_sizes[i];
     }
+
     return acts_memory;
 }
 
@@ -376,19 +428,30 @@ void gpt2_forward(GPT2 *model, int *inputs, int *targets, size_t B, size_t T) {
         model->batch_size = B;
         model->seq_len = T;
 
-        // allocate space
-        model->act_sizes[0] = B * T * C;            // encoded
-        model->act_sizes[1] = L * B * T * C;        // ln1
-        model->act_sizes[2] = L * B * T * C * 3;    // qkv
-        model->act_sizes[3] = L * B * T * C;        // atty
-        model->act_sizes[4] = L * B * NH * T * T;   // preatt
-        model->act_sizes[5] = L * B * NH * T * T;   // att
+        // allocate space for activations
+        model->act_sizes[0] = B * T * C;               // encoded
+        model->act_sizes[1] = L * B * T * C;           // ln1
+        model->act_sizes[2] = L * B * T * 3 * C;       // qkv
+        model->act_sizes[3] = L * B * T * C;           // atty
+        model->act_sizes[4] = L * B * NH * T * T;      // preatt
+        model->act_sizes[5] = L * B * NH * T * T;      // att
+        model->act_sizes[6] = L * B * T * C;           // attproj
+        model->act_sizes[7] = L * B * T * C;           // residual2
+        model->act_sizes[8] = L * B * T * C;           // ln2
+        model->act_sizes[9] = L * B * T * 4 * C;       // fch
+        model->act_sizes[10] = L * B * T * 4 * C;      // fch_gelu
+        model->act_sizes[11] = L * B * T * C;          // fcproj
+        model->act_sizes[12] = L * B * T * C;          // residual3
+        model->act_sizes[13] = B * T * C;              // lnf
+        model->act_sizes[14] = B * T * V;              // logits
+
         size_t num_activations = 0;
         for (int i = 0; i < NUM_ACTIVATION_TENSORS; i++) {
             num_activations += model->act_sizes[i];
         }
         printf("num_activations: %ld\n", num_activations);
         model->num_activations = num_activations;
+
         model->acts_memory = malloc_and_point_activations(&model->acts, model->act_sizes);
         model->inputs = (int*)malloc(B * T * sizeof(int));
         model->targets = (int*)malloc(B * T * sizeof(int));
@@ -410,7 +473,7 @@ void gpt2_forward(GPT2 *model, int *inputs, int *targets, size_t B, size_t T) {
     ActivationTensors acts = model->acts;
     float* residual;
 
-    encoder_forward(acts.encoded, inputs, params.wte, params.wtp, B, T, C);
+    encoder_forward(acts.encoded, inputs, params.wte, params.wpe, B, T, C);
     printf("=================== encoder output ==================\n");
     for (int i = 0; i < B * T; i++) {
         printf("%f ", acts.encoded[i]);
