@@ -15,30 +15,44 @@ typedef struct {
     int num_parameters; // total trainable weights
 } GPT2Config;
 
-#define NUM_PARAMETER_TENSORS 8
+// the parameters of the model
+#define NUM_PARAMETER_TENSORS 16
 typedef struct {
-    float *wte; // weight token embeddings
-    float *wtp; // weight token positioning
-    float *ln1w; // 1st layer normalization's weights
-    float *ln1b;
-    float *qkvw;
-    float *qkvb;
-    float *attprojw;
-    float *attprojb;
-//    float *ln2w;
-//    float *ln2b;
-//    float *lnfw;
-//    float *lnfb;
+    float* wte; // (V, C)
+    float* wpe; // (maxT, C)
+    float* ln1w; // (L, C)
+    float* ln1b; // (L, C)
+    float* qkvw; // (L, 3*C, C)
+    float* qkvb; // (L, 3*C)
+    float* attprojw; // (L, C, C)
+    float* attprojb; // (L, C)
+    float* ln2w; // (L, C)
+    float* ln2b; // (L, C)
+    float* fcw; // (L, 4*C, C)
+    float* fcb; // (L, 4*C)
+    float* fcprojw; // (L, C, 4*C)
+    float* fcprojb; // (L, C)
+    float* lnfw; // (C)
+    float* lnfb; // (C)
 } ParameterTensors;
 
 #define NUM_ACTIVATION_TENSORS 6
 typedef struct {
-    float *encoded; // output of encoding
-    float *ln1;     // output of first layer normalization
-    float *qkv;     // output of qkv
-    float *atty;
-    float *preatt;  // pre attention cache to store QK
-    float *att;
+    float *encoded; // (B, T, C) // output of encoding
+    float *ln1;     // (L, B, T, C) // output of first layer normalization
+    float *qkv;     // (L, B, T, 3*C) // output of qkv
+    float *atty;  // (L, B, T, C) // output of attention before projection
+    float *preatt; // (L, B, NH, T, T) // pre attention cache to store QK
+    float *att; // (L, B, NH, T, T) // attention cache to store softmax(QK)
+    float *attproj; // (L, B, T, C) // attention output projected
+    float *residual2; // (L, B, T, C)
+    float *ln2; // (L, B, T, C)
+    float *fch; // (L, B, T, 4*C)
+    float *fch_gelu; // (L, B, T, 4*C)
+    float *fcproj; // (L, B, T, C)
+    float *residual3; // (L, B, T, C)
+    float *lnf; // (B, T, C)
+    float *logits; // (B, T, V)
 } ActivationTensors;
 
 typedef struct {
