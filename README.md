@@ -58,7 +58,7 @@ manually tracking tensor shapes through every layer until the architecture actua
 | Masked multi-headed attention | Done |
 | GELU activation | Done |
 | Residual connections | Done |
-| Full forward pass on TinyShakespeare | In Progress |
+| Full forward pass on TinyShakespeare | Done |
 
 **Batch config:** 4 batches × 64 tokens
 
