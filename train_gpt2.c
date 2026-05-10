@@ -526,6 +526,26 @@ void gpt2_forward(GPT2 *model, int *inputs, int *targets, size_t B, size_t T) {
 
 }
 
+// numerically stable softmax in-place over n elements
+void softmax(float *x, int n) {
+    float maxval = -FLT_MAX;
+    for (int i = 0; i < n; i++) { if (x[i] > maxval) maxval = x[i]; }
+    float expsum = 0.0f;
+    for (int i = 0; i < n; i++) { x[i] = expf(x[i] - maxval); expsum += x[i]; }
+    for (int i = 0; i < n; i++) { x[i] /= expsum; }
+}
+
+// sample one index from a probability distribution
+// coin is a uniform random float in [0, 1)
+int sample_multinomial(float *probs, int n, float coin) {
+    float cdf = 0.0f;
+    for (int i = 0; i < n; i++) {
+        cdf += probs[i];
+        if (coin < cdf) return i;
+    }
+    return n - 1; // fallback for floating point rounding
+}
+
 int main() {
     GPT2 model;
     gpt2_build_from_checkpoint(&model, "../gpt2_124M.bin");
@@ -541,8 +561,60 @@ int main() {
 
     dataloader_next_batch(&train_loader);
     
-    gpt2_forward(&model, train_loader.inputs, train_loader.targets, B, T);
+    // gpt2_forward(&model, train_loader.inputs, train_loader.targets, B, T);
     
+    // --- Generation loop ---
+    printf("\n--- Generating ---\n");
+
+    int V  = model.config.vocab_size;
+    int Vp = model.config.padded_vocab_size;
+
+    // mutable context window seeded from the loaded batch
+    int *gen_tokens = (int*)malloc(B * T * sizeof(int));
+    memcpy(gen_tokens, train_loader.inputs, B * T * sizeof(int));
+
+    srand(43);
+
+    float *probs = (float*)malloc(V * sizeof(float)); // reused every step
+
+    int gen_steps = 100;
+    for (int step = 0; step < gen_steps; step++) {
+
+        // forward pass — pass NULL targets (no loss needed during inference)
+        gpt2_forward(&model, gen_tokens, NULL, B, T);
+
+        // --- sample from batch item b=0, last position T-1 ---
+        int b = 0;
+        // logits layout: (B, T, Vp), so offset to [b, T-1, 0]
+        float *logits_last = model.acts.logits + b * T * Vp + (T - 1) * Vp;
+
+        // copy only the real vocab (ignore the padded tail) then softmax
+        for (int i = 0; i < V; i++) probs[i] = logits_last[i];
+        softmax(probs, V);
+
+        float coin      = (float) rand() / (float) RAND_MAX;
+        int next_token  = sample_multinomial(probs, V, coin);
+
+        // decode and print
+        if (tokenizer.init_ok) {
+            const char *tok = tokenizer_decode(&tokenizer, next_token);
+            printf("%s", tok);
+        } else {
+            printf("%d ", next_token);
+        }
+        fflush(stdout);
+
+        // slide the context window left by 1, append the new token
+        for (int t = 0; t < T - 1; t++) {
+            gen_tokens[b * T + t] = gen_tokens[b * T + t + 1];
+        }
+        gen_tokens[b * T + (T - 1)] = next_token;
+    }
+    printf("\n");
+
+    free(gen_tokens);
+    free(probs);
+
     dataloader_free(&train_loader);
     tokenizer_free(&tokenizer);
     free(model.params_memory);
