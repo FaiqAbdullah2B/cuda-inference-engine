@@ -2,8 +2,18 @@
 #include "./llmc/dataloader.h"
 #include "./llmc/tokenizer.h"
 #include "./llmc/rand.h"
+#include <stdio.h>
+#include <stdlib.h>
 #include <math.h>
 #include <string.h>
+#include <float.h>  
+#include <assert.h> 
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846f
+#endif
+
+#define HEADER_SIZE 256
 
 typedef struct {
     int max_seq_len; // max sequence length
@@ -15,30 +25,44 @@ typedef struct {
     int num_parameters; // total trainable weights
 } GPT2Config;
 
-#define NUM_PARAMETER_TENSORS 8
+// the parameters of the model
+#define NUM_PARAMETER_TENSORS 16
 typedef struct {
-    float *wte; // weight token embeddings
-    float *wtp; // weight token positioning
-    float *ln1w; // 1st layer normalization's weights
-    float *ln1b;
-    float *qkvw;
-    float *qkvb;
-    float *attprojw;
-    float *attprojb;
-//    float *ln2w;
-//    float *ln2b;
-//    float *lnfw;
-//    float *lnfb;
+    float* wte; // (V, C)
+    float* wpe; // (maxT, C)
+    float* ln1w; // (L, C)
+    float* ln1b; // (L, C)
+    float* qkvw; // (L, 3*C, C)
+    float* qkvb; // (L, 3*C)
+    float* attprojw; // (L, C, C)
+    float* attprojb; // (L, C)
+    float* ln2w; // (L, C)
+    float* ln2b; // (L, C)
+    float* fcw; // (L, 4*C, C)
+    float* fcb; // (L, 4*C)
+    float* fcprojw; // (L, C, 4*C)
+    float* fcprojb; // (L, C)
+    float* lnfw; // (C)
+    float* lnfb; // (C)
 } ParameterTensors;
 
-#define NUM_ACTIVATION_TENSORS 6
+#define NUM_ACTIVATION_TENSORS 15
 typedef struct {
-    float *encoded; // output of encoding
-    float *ln1;     // output of first layer normalization
-    float *qkv;     // output of qkv
-    float *atty;
-    float *preatt;  // pre attention cache to store QK
-    float *att;
+    float *encoded; // (B, T, C) // output of encoding
+    float *ln1;     // (L, B, T, C) // output of first layer normalization
+    float *qkv;     // (L, B, T, 3*C) // output of qkv
+    float *atty;  // (L, B, T, C) // output of attention before projection
+    float *preatt; // (L, B, NH, T, T) // pre attention cache to store QK
+    float *att; // (L, B, NH, T, T) // attention cache to store softmax(QK)
+    float *attproj; // (L, B, T, C) // attention output projected
+    float *residual2; // (L, B, T, C)
+    float *ln2; // (L, B, T, C)
+    float *fch; // (L, B, T, 4*C)
+    float *fch_gelu; // (L, B, T, 4*C)
+    float *fcproj; // (L, B, T, C)
+    float *residual3; // (L, B, T, C)
+    float *lnf; // (B, T, C)
+    float *logits; // (B, T, V)
 } ActivationTensors;
 
 typedef struct {
@@ -74,6 +98,14 @@ void init_parameters_sizes(size_t *param_sizes, GPT2Config config) {
     param_sizes[5] = L * (3 * C);       // qkvb
     param_sizes[6] = L * C * C;         // attprojw
     param_sizes[7] = L * C;             // attprojb
+    param_sizes[8] = (size_t)L * C;           // ln2w
+    param_sizes[9] = (size_t)L * C;           // ln2b
+    param_sizes[10] = (size_t)L * 4 * C * C;  // fcw
+    param_sizes[11] = (size_t)L * 4 * C;      // fcb
+    param_sizes[12] = (size_t)L * C * 4 * C;  // fcprojw
+    param_sizes[13] = (size_t)L * C;          // fcprojb
+    param_sizes[14] = (size_t)C;              // lnfw
+    param_sizes[15] = (size_t)C;              // lnfb
 }
 
 // adds positional encoding and encoded token into an output
@@ -166,7 +198,7 @@ void attention_forward(float *out, float *preatt_cache, float *att_cache,
             for (int h = 0; h < NH; h++) {
                 // index to query
                 float *queryt = inp + b * T * C3 + t * C3 + h * hs;
-                float maxval = FLT_MIN;
+                float maxval = -FLT_MAX;
                 // preceding sequence of words only
                 for (int t2 = 0; t2 <= t; t2++) {
                     // index to key
@@ -196,13 +228,8 @@ void attention_forward(float *out, float *preatt_cache, float *att_cache,
                 float expsum_inv = expsum == 0.0f ? 0.0f : 1.0f / expsum;
                 
                 // normalization to get softmax
-                for (int t2 = 0; t2 < t; t2++) {
-                    if (t2 <= t) {
-                        att_cache[t2] *= expsum_inv;
-                    }
-                    else {
-                        att_cache[t2] = 0.0f;
-                    }
+                for (int t2 = 0; t2 <= t; t2++) {
+                    att_cache[t2] *= expsum_inv;
                 }
 
                 float *out_bth = out + b * T * C + t * C + h * hs;
@@ -236,51 +263,89 @@ void gelu_forward(float *out, float *inp, int N) {
     for (int i = 0; i < N; i++) {
         float x = inp[i];
         float cube = 0.044715f * x * x * x;
-        out[i] = 0.5f * x * (1.0f + tanh(GELU_SCALING_FACTOR * (x + cube)));
+        out[i] = 0.5f * x * (1.0f + tanhf(GELU_SCALING_FACTOR * (x + cube)));
     }
 }
 
 float *malloc_and_point_parameters(ParameterTensors *params, size_t *param_sizes) {
-    size_t num_params = 0;
-    for (size_t i = 0; i < NUM_PARAMETER_TENSORS; i++) {
-        num_params += param_sizes[i];
+    size_t total_elements = 0;
+    for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
+        total_elements += param_sizes[i];
     }
     
     // malloc all the parameters in one block of memory
-    float *params_memory = (float*)malloc(num_params * sizeof(float));
-
-    // assign all the tensors
-    float **ptrs[] = {
-        &params->wte, &params->wtp, &params->ln1w, &params->ln1b, 
-        &params->qkvw, &params->qkvb, &params->attprojw, &params->attprojb
-    };
-    
-    // set all the starting locations for pointers
-    float *params_memory_iterator = params_memory;
-    for (size_t i = 0; i < NUM_PARAMETER_TENSORS; i++) {
-        *(ptrs[i]) = params_memory_iterator;
-        params_memory_iterator += param_sizes[i];
+    float *params_memory = (float*)malloc(total_elements * sizeof(float));
+    if (params_memory == NULL) {
+        printf("ERROR: Failed to allocate parameters memory\n");
+        exit(1);
     }
+
+    // casting the activation tensor pointer to a float** for easier assignment
+    float **ptrs[NUM_PARAMETER_TENSORS] = {
+        &params->wte, 
+        &params->wpe, 
+        &params->ln1w, 
+        &params->ln1b, 
+        &params->qkvw, 
+        &params->qkvb, 
+        &params->attprojw, 
+        &params->attprojb, 
+        &params->ln2w, 
+        &params->ln2b, 
+        &params->fcw, 
+        &params->fcb, 
+        &params->fcprojw, 
+        &params->fcprojb, 
+        &params->lnfw, 
+        &params->lnfb
+    };
+
+    float *current_ptr = params_memory;
+    for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
+        *ptrs[i] = current_ptr;
+        current_ptr += param_sizes[i];
+    }
+
     return params_memory;
 }
 
 float *malloc_and_point_activations(ActivationTensors *acts, size_t *act_sizes) {
-    size_t num_activations = 0;
-    for (size_t i = 0; i < NUM_ACTIVATION_TENSORS; i++) {
-        num_activations += act_sizes[i];
+    // Calculate the total size
+    size_t total_elements = 0;
+    for (int i = 0; i < NUM_ACTIVATION_TENSORS; i++) {
+        total_elements += act_sizes[i];
     }
     
-    float *acts_memory = (float*)malloc(num_activations * sizeof(float));
-    float **ptrs[] = {
-        &acts->encoded, &acts->ln1, &acts->qkv, &acts->atty, 
-        &acts->preatt, &acts->att
+    float *acts_memory = (float*)malloc(total_elements * sizeof(float));
+    if (acts_memory == NULL) {
+        printf("ERROR: Failed to allocate activations memory\n");
+        exit(1);
+    }
+
+    float **ptrs[NUM_ACTIVATION_TENSORS] = {
+        &acts->encoded, 
+        &acts->ln1, 
+        &acts->qkv, 
+        &acts->atty, 
+        &acts->preatt, 
+        &acts->att, 
+        &acts->attproj, 
+        &acts->residual2, 
+        &acts->ln2, 
+        &acts->fch, 
+        &acts->fch_gelu, 
+        &acts->fcproj, 
+        &acts->residual3, 
+        &acts->lnf, 
+        &acts->logits
     };
 
-    float *acts_memory_iterator = acts_memory;
-    for (size_t i = 0; i < NUM_ACTIVATION_TENSORS; i++) {
-        *(ptrs[i]) = acts_memory_iterator;
-        acts_memory_iterator += act_sizes[i];
+    float *current_ptr = acts_memory;
+    for (int i = 0; i < NUM_ACTIVATION_TENSORS; i++) {
+        *ptrs[i] = current_ptr;
+        current_ptr += act_sizes[i];
     }
+
     return acts_memory;
 }
 
@@ -294,7 +359,7 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char *checkpoint_path) {
     int model_header[HEADER_SIZE];
     fread(model_header, sizeof(int), 256, model_file);
     if (model_header[0] != 20240326) {
-        printf("Bag magic model file\n");
+        printf("Bad magic model file\n");
         exit(1);
     }
 
@@ -362,28 +427,39 @@ void gpt2_forward(GPT2 *model, int *inputs, int *targets, size_t B, size_t T) {
         model->batch_size = B;
         model->seq_len = T;
 
-        // allocate space
-        model->act_sizes[0] = B * T * C;            // encoded
-        model->act_sizes[1] = L * B * T * C;        // ln1
-        model->act_sizes[2] = L * B * T * C * 3;    // qkv
-        model->act_sizes[3] = L * B * T * C;        // atty
-        model->act_sizes[4] = L * B * NH * T * T;   // preatt
-        model->act_sizes[5] = L * B * NH * T * T;   // att
+        // allocate space for activations
+        model->act_sizes[0] = B * T * C;               // encoded
+        model->act_sizes[1] = L * B * T * C;           // ln1
+        model->act_sizes[2] = L * B * T * 3 * C;       // qkv
+        model->act_sizes[3] = L * B * T * C;           // atty
+        model->act_sizes[4] = L * B * NH * T * T;      // preatt
+        model->act_sizes[5] = L * B * NH * T * T;      // att
+        model->act_sizes[6] = L * B * T * C;           // attproj
+        model->act_sizes[7] = L * B * T * C;           // residual2
+        model->act_sizes[8] = L * B * T * C;           // ln2
+        model->act_sizes[9] = L * B * T * 4 * C;       // fch
+        model->act_sizes[10] = L * B * T * 4 * C;      // fch_gelu
+        model->act_sizes[11] = L * B * T * C;          // fcproj
+        model->act_sizes[12] = L * B * T * C;          // residual3
+        model->act_sizes[13] = B * T * C;              // lnf
+        model->act_sizes[14] = B * T * Vp;             // logits
+
         size_t num_activations = 0;
         for (int i = 0; i < NUM_ACTIVATION_TENSORS; i++) {
             num_activations += model->act_sizes[i];
         }
         printf("num_activations: %ld\n", num_activations);
         model->num_activations = num_activations;
+
         model->acts_memory = malloc_and_point_activations(&model->acts, model->act_sizes);
         model->inputs = (int*)malloc(B * T * sizeof(int));
         model->targets = (int*)malloc(B * T * sizeof(int));
-    }
-    else {
+    } else {
         if (B != model->batch_size || T != model->seq_len) {
-            printf("Model: B=%d T=%d, Desired: B=%ld T=%ld\n", 
-                   model->batch_size, model->seq_len, B, T);
-        }
+        printf("Error: Dynamic resizing not supported. Model: B=%d T=%d, Desired: B=%ld T=%ld\n", 
+               model->batch_size, model->seq_len, B, T);
+        exit(1); // Abort to prevent buffer overflow
+    }
     }
 
     // cache the inputs/targets
@@ -396,54 +472,78 @@ void gpt2_forward(GPT2 *model, int *inputs, int *targets, size_t B, size_t T) {
     ActivationTensors acts = model->acts;
     float* residual;
 
-    encoder_forward(acts.encoded, inputs, params.wte, params.wtp, B, T, C);
-    printf("=================== encoder output ==================\n");
-    for (int i = 0; i < B * T; i++) {
-        printf("%f ", acts.encoded[i]);
-    }
-    printf("\n");
+    // --- Embedding Layer ---
+    encoder_forward(acts.encoded, inputs, params.wte, params.wpe, B, T, C);
 
-    float *ln1w = params.ln1w;
-    float *ln1b = params.ln1b;
-    layernorm_forward(acts.ln1, acts.encoded, ln1w, ln1b, B, T, C);
-    printf("=================== layernorm output ==================\n");
-    for (int i = 0; i < B * T; i++) {
-        printf("%f ", acts.ln1[i]);
-    }
-    printf("\n");
-
-/*
     for (int l = 0; l < L; l++) {
-        float *ln1_l = acts.ln1 + l * B * T * C;
 
-        float *qkv_l = acts.qkv + l * B * T * (3 * C);
+        residual = l == 0 ? acts.encoded : acts.residual3 + (l-1) * B * T * C;
 
-        float *qkvw_l = params.qkvw + l * (3 * C * C);
-        float *qkvb_l = params.qkvb + l * (3 * C);
+        // get the pointers of the weights for this layer
+        float* l_ln1w = params.ln1w + l * C;
+        float* l_ln1b = params.ln1b + l * C;
+        float* l_qkvw = params.qkvw + l * 3*C * C;
+        float* l_qkvb = params.qkvb + l * 3*C;
+        float* l_attprojw = params.attprojw + l * C * C;
+        float* l_attprojb = params.attprojb + l * C;
+        float* l_ln2w = params.ln2w + l * C;
+        float* l_ln2b = params.ln2b + l * C;
+        float* l_fcw = params.fcw + l * 4*C * C;
+        float* l_fcb = params.fcb + l * 4*C;
+        float* l_fcprojw = params.fcprojw + l * C * 4*C;
+        float* l_fcprojb = params.fcprojb + l * C;
 
-        matmul_forward(qkv_l, ln1_l, qkvw_l, qkvb_l, B, T, C, 3 * C);
+        // get the pointers of the activations for this layer
+        float* l_ln1 = acts.ln1 + l * B * T * C;
+        float* l_qkv = acts.qkv + l * B * T * 3*C;
+        float* l_atty = acts.atty + l * B * T * C;
+        float* l_preatt = acts.preatt + l * B * NH * T * T;
+        float* l_att = acts.att + l * B * NH * T * T;
+        float* l_attproj = acts.attproj + l * B * T * C;
+        float* l_residual2 = acts.residual2 + l * B * T * C;
+        float* l_ln2 = acts.ln2 + l * B * T * C;
+        float* l_fch = acts.fch + l * B * T * 4*C;
+        float* l_fch_gelu = acts.fch_gelu + l * B * T * 4*C;
+        float* l_fcproj = acts.fcproj + l * B * T * C;
+        float* l_residual3 = acts.residual3 + l * B * T * C;
+
+        // now do the forward pass
+        layernorm_forward(l_ln1, residual, l_ln1w, l_ln1b, B, T, C);
+        matmul_forward(l_qkv, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C);
+        attention_forward(l_atty, l_preatt, l_att, l_qkv, B, T, C, NH);
+        matmul_forward(l_attproj, l_atty, l_attprojw, l_attprojb, B, T, C, C);
+        residual_forward(l_residual2, residual, l_attproj, B*T*C);
+        layernorm_forward(l_ln2, l_residual2, l_ln2w, l_ln2b, B, T, C);
+        matmul_forward(l_fch, l_ln2, l_fcw, l_fcb, B, T, C, 4*C);
+        gelu_forward(l_fch_gelu, l_fch, B*T*4*C);
+        matmul_forward(l_fcproj, l_fch_gelu, l_fcprojw, l_fcprojb, B, T, 4*C, C);
+        residual_forward(l_residual3, l_residual2, l_fcproj, B*T*C);
     }
-*/
-    float *ln1_l = acts.ln1;
-    float *qkv_l = acts.qkv;
-    float *qkvw_l = params.qkvw;    
-    float *qkvb_l = params.qkvb;
-    matmul_forward(qkv_l, ln1_l, qkvw_l, qkvb_l, B, T, C, 3 * C);
-    printf("=================== QKV output ==================\n");
-    for (int i = 0; i < B * T; i++) {
-        printf("%f ", acts.qkv[i]);
+
+    residual = acts.residual3 + (L-1) * B * T * C; // last residual is in residual3
+    layernorm_forward(acts.lnf, residual, params.lnfw, params.lnfb, B, T, C);
+    matmul_forward(acts.logits, acts.lnf, params.wte, NULL, B, T, C, Vp);
+
+}
+
+// numerically stable softmax in-place over n elements
+void softmax(float *x, int n) {
+    float maxval = -FLT_MAX;
+    for (int i = 0; i < n; i++) { if (x[i] > maxval) maxval = x[i]; }
+    float expsum = 0.0f;
+    for (int i = 0; i < n; i++) { x[i] = expf(x[i] - maxval); expsum += x[i]; }
+    for (int i = 0; i < n; i++) { x[i] /= expsum; }
+}
+
+// sample one index from a probability distribution
+// coin is a uniform random float in [0, 1)
+int sample_multinomial(float *probs, int n, float coin) {
+    float cdf = 0.0f;
+    for (int i = 0; i < n; i++) {
+        cdf += probs[i];
+        if (coin < cdf) return i;
     }
-    printf("\n");
-    
-    float *atty = acts.atty;
-    float *att = acts.att;
-    float *preatt = acts.preatt;
-    attention_forward(atty, preatt, att, qkv_l, B, T, C, NH);
-    printf("=================== Attention output ==================\n");
-    for (int i = 0; i < B * T; i++) {
-        printf("%f ", atty[i]);
-    }
-    printf("\n");
+    return n - 1; // fallback for floating point rounding
 }
 
 int main() {
@@ -460,8 +560,67 @@ int main() {
     tokenizer_init(&tokenizer, "../gpt2_tokenizer.bin");
 
     dataloader_next_batch(&train_loader);
-    gpt2_forward(&model, train_loader.inputs, train_loader.targets, B, T);
     
+    // gpt2_forward(&model, train_loader.inputs, train_loader.targets, B, T);
+    
+    // --- Generation loop ---
+    printf("\n--- Generating ---\n");
+
+    int V  = model.config.vocab_size;
+    int Vp = model.config.padded_vocab_size;
+
+    // mutable context window seeded from the loaded batch
+    int *gen_tokens = (int*)malloc(B * T * sizeof(int));
+    memcpy(gen_tokens, train_loader.inputs, B * T * sizeof(int));
+
+    srand(43);
+
+    float *probs = (float*)malloc(V * sizeof(float)); // reused every step
+
+    int gen_steps = 100;
+    for (int step = 0; step < gen_steps; step++) {
+
+        // forward pass — pass NULL targets (no loss needed during inference)
+        gpt2_forward(&model, gen_tokens, NULL, B, T);
+
+        // --- sample from batch item b=0, last position T-1 ---
+        int b = 0;
+        // logits layout: (B, T, Vp), so offset to [b, T-1, 0]
+        float *logits_last = model.acts.logits + b * T * Vp + (T - 1) * Vp;
+
+        // copy only the real vocab (ignore the padded tail) then softmax
+        for (int i = 0; i < V; i++) probs[i] = logits_last[i];
+        softmax(probs, V);
+
+        float coin      = (float) rand() / (float) RAND_MAX;
+        int next_token  = sample_multinomial(probs, V, coin);
+
+        // decode and print
+        if (tokenizer.init_ok) {
+            const char *tok = tokenizer_decode(&tokenizer, next_token);
+            printf("%s", tok);
+        } else {
+            printf("%d ", next_token);
+        }
+        fflush(stdout);
+
+        // slide the context window left by 1, append the new token
+        for (int t = 0; t < T - 1; t++) {
+            gen_tokens[b * T + t] = gen_tokens[b * T + t + 1];
+        }
+        gen_tokens[b * T + (T - 1)] = next_token;
+    }
+    printf("\n");
+
+    free(gen_tokens);
+    free(probs);
+
     dataloader_free(&train_loader);
     tokenizer_free(&tokenizer);
+    free(model.params_memory);
+    if (model.acts_memory != NULL) {
+        free(model.acts_memory);
+        free(model.inputs);
+        free(model.targets);
+    }
 }
