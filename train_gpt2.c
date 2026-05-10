@@ -442,7 +442,7 @@ void gpt2_forward(GPT2 *model, int *inputs, int *targets, size_t B, size_t T) {
         model->act_sizes[11] = L * B * T * C;          // fcproj
         model->act_sizes[12] = L * B * T * C;          // residual3
         model->act_sizes[13] = B * T * C;              // lnf
-        model->act_sizes[14] = B * T * V;              // logits
+        model->act_sizes[14] = B * T * Vp;             // logits
 
         size_t num_activations = 0;
         for (int i = 0; i < NUM_ACTIVATION_TENSORS; i++) {
