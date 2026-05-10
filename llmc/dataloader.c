@@ -78,4 +78,5 @@ void dataloader_free(Dataloader *loader) {
     if (loader->tokens_file) fclose(loader->tokens_file);
     if (loader->inputs) free(loader->inputs);
     if (loader->targets) free(loader->targets);
+    if (loader->buffer) free(loader->buffer);
 }
