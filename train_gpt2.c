@@ -2,6 +2,8 @@
 #include "./llmc/dataloader.h"
 #include "./llmc/tokenizer.h"
 #include "./llmc/rand.h"
+#include <stdio.h>
+#include <stdlib.h>
 #include <math.h>
 #include <string.h>
 #include <float.h>  
@@ -10,6 +12,8 @@
 #ifndef M_PI
 #define M_PI 3.14159265358979323846f
 #endif
+
+#define HEADER_SIZE 256
 
 typedef struct {
     int max_seq_len; // max sequence length
@@ -194,7 +198,7 @@ void attention_forward(float *out, float *preatt_cache, float *att_cache,
             for (int h = 0; h < NH; h++) {
                 // index to query
                 float *queryt = inp + b * T * C3 + t * C3 + h * hs;
-                float maxval = FLT_MIN;
+                float maxval = -FLT_MAX;
                 // preceding sequence of words only
                 for (int t2 = 0; t2 <= t; t2++) {
                     // index to key
@@ -224,13 +228,8 @@ void attention_forward(float *out, float *preatt_cache, float *att_cache,
                 float expsum_inv = expsum == 0.0f ? 0.0f : 1.0f / expsum;
                 
                 // normalization to get softmax
-                for (int t2 = 0; t2 < t; t2++) {
-                    if (t2 <= t) {
-                        att_cache[t2] *= expsum_inv;
-                    }
-                    else {
-                        att_cache[t2] = 0.0f;
-                    }
+                for (int t2 = 0; t2 <= t; t2++) {
+                    att_cache[t2] *= expsum_inv;
                 }
 
                 float *out_bth = out + b * T * C + t * C + h * hs;
@@ -264,7 +263,7 @@ void gelu_forward(float *out, float *inp, int N) {
     for (int i = 0; i < N; i++) {
         float x = inp[i];
         float cube = 0.044715f * x * x * x;
-        out[i] = 0.5f * x * (1.0f + tanh(GELU_SCALING_FACTOR * (x + cube)));
+        out[i] = 0.5f * x * (1.0f + tanhf(GELU_SCALING_FACTOR * (x + cube)));
     }
 }
 
@@ -360,7 +359,7 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char *checkpoint_path) {
     int model_header[HEADER_SIZE];
     fread(model_header, sizeof(int), 256, model_file);
     if (model_header[0] != 20240326) {
-        printf("Bag magic model file\n");
+        printf("Bad magic model file\n");
         exit(1);
     }
 
@@ -455,12 +454,12 @@ void gpt2_forward(GPT2 *model, int *inputs, int *targets, size_t B, size_t T) {
         model->acts_memory = malloc_and_point_activations(&model->acts, model->act_sizes);
         model->inputs = (int*)malloc(B * T * sizeof(int));
         model->targets = (int*)malloc(B * T * sizeof(int));
-    }
-    else {
+    } else {
         if (B != model->batch_size || T != model->seq_len) {
-            printf("Model: B=%d T=%d, Desired: B=%ld T=%ld\n", 
-                   model->batch_size, model->seq_len, B, T);
-        }
+        printf("Error: Dynamic resizing not supported. Model: B=%d T=%d, Desired: B=%ld T=%ld\n", 
+               model->batch_size, model->seq_len, B, T);
+        exit(1); // Abort to prevent buffer overflow
+    }
     }
 
     // cache the inputs/targets
@@ -473,54 +472,58 @@ void gpt2_forward(GPT2 *model, int *inputs, int *targets, size_t B, size_t T) {
     ActivationTensors acts = model->acts;
     float* residual;
 
+    // --- Embedding Layer ---
     encoder_forward(acts.encoded, inputs, params.wte, params.wpe, B, T, C);
-    printf("=================== encoder output ==================\n");
-    for (int i = 0; i < B * T; i++) {
-        printf("%f ", acts.encoded[i]);
-    }
-    printf("\n");
 
-    float *ln1w = params.ln1w;
-    float *ln1b = params.ln1b;
-    layernorm_forward(acts.ln1, acts.encoded, ln1w, ln1b, B, T, C);
-    printf("=================== layernorm output ==================\n");
-    for (int i = 0; i < B * T; i++) {
-        printf("%f ", acts.ln1[i]);
-    }
-    printf("\n");
-
-/*
     for (int l = 0; l < L; l++) {
-        float *ln1_l = acts.ln1 + l * B * T * C;
 
-        float *qkv_l = acts.qkv + l * B * T * (3 * C);
+        residual = l == 0 ? acts.encoded : acts.residual3 + (l-1) * B * T * C;
 
-        float *qkvw_l = params.qkvw + l * (3 * C * C);
-        float *qkvb_l = params.qkvb + l * (3 * C);
+        // get the pointers of the weights for this layer
+        float* l_ln1w = params.ln1w + l * C;
+        float* l_ln1b = params.ln1b + l * C;
+        float* l_qkvw = params.qkvw + l * 3*C * C;
+        float* l_qkvb = params.qkvb + l * 3*C;
+        float* l_attprojw = params.attprojw + l * C * C;
+        float* l_attprojb = params.attprojb + l * C;
+        float* l_ln2w = params.ln2w + l * C;
+        float* l_ln2b = params.ln2b + l * C;
+        float* l_fcw = params.fcw + l * 4*C * C;
+        float* l_fcb = params.fcb + l * 4*C;
+        float* l_fcprojw = params.fcprojw + l * C * 4*C;
+        float* l_fcprojb = params.fcprojb + l * C;
 
-        matmul_forward(qkv_l, ln1_l, qkvw_l, qkvb_l, B, T, C, 3 * C);
+        // get the pointers of the activations for this layer
+        float* l_ln1 = acts.ln1 + l * B * T * C;
+        float* l_qkv = acts.qkv + l * B * T * 3*C;
+        float* l_atty = acts.atty + l * B * T * C;
+        float* l_preatt = acts.preatt + l * B * NH * T * T;
+        float* l_att = acts.att + l * B * NH * T * T;
+        float* l_attproj = acts.attproj + l * B * T * C;
+        float* l_residual2 = acts.residual2 + l * B * T * C;
+        float* l_ln2 = acts.ln2 + l * B * T * C;
+        float* l_fch = acts.fch + l * B * T * 4*C;
+        float* l_fch_gelu = acts.fch_gelu + l * B * T * 4*C;
+        float* l_fcproj = acts.fcproj + l * B * T * C;
+        float* l_residual3 = acts.residual3 + l * B * T * C;
+
+        // now do the forward pass
+        layernorm_forward(l_ln1, residual, l_ln1w, l_ln1b, B, T, C);
+        matmul_forward(l_qkv, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C);
+        attention_forward(l_atty, l_preatt, l_att, l_qkv, B, T, C, NH);
+        matmul_forward(l_attproj, l_atty, l_attprojw, l_attprojb, B, T, C, C);
+        residual_forward(l_residual2, residual, l_attproj, B*T*C);
+        layernorm_forward(l_ln2, l_residual2, l_ln2w, l_ln2b, B, T, C);
+        matmul_forward(l_fch, l_ln2, l_fcw, l_fcb, B, T, C, 4*C);
+        gelu_forward(l_fch_gelu, l_fch, B*T*4*C);
+        matmul_forward(l_fcproj, l_fch_gelu, l_fcprojw, l_fcprojb, B, T, 4*C, C);
+        residual_forward(l_residual3, l_residual2, l_fcproj, B*T*C);
     }
-*/
-    float *ln1_l = acts.ln1;
-    float *qkv_l = acts.qkv;
-    float *qkvw_l = params.qkvw;    
-    float *qkvb_l = params.qkvb;
-    matmul_forward(qkv_l, ln1_l, qkvw_l, qkvb_l, B, T, C, 3 * C);
-    printf("=================== QKV output ==================\n");
-    for (int i = 0; i < B * T; i++) {
-        printf("%f ", acts.qkv[i]);
-    }
-    printf("\n");
-    
-    float *atty = acts.atty;
-    float *att = acts.att;
-    float *preatt = acts.preatt;
-    attention_forward(atty, preatt, att, qkv_l, B, T, C, NH);
-    printf("=================== Attention output ==================\n");
-    for (int i = 0; i < B * T; i++) {
-        printf("%f ", atty[i]);
-    }
-    printf("\n");
+
+    residual = acts.residual3 + (L-1) * B * T * C; // last residual is in residual3
+    layernorm_forward(acts.lnf, residual, params.lnfw, params.lnfb, B, T, C);
+    matmul_forward(acts.logits, acts.lnf, params.wte, NULL, B, T, C, Vp);
+
 }
 
 int main() {
@@ -537,8 +540,15 @@ int main() {
     tokenizer_init(&tokenizer, "../gpt2_tokenizer.bin");
 
     dataloader_next_batch(&train_loader);
+    
     gpt2_forward(&model, train_loader.inputs, train_loader.targets, B, T);
     
     dataloader_free(&train_loader);
     tokenizer_free(&tokenizer);
+    free(model.params_memory);
+    if (model.acts_memory != NULL) {
+        free(model.acts_memory);
+        free(model.inputs);
+        free(model.targets);
+    }
 }
