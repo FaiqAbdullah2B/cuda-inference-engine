@@ -12,6 +12,8 @@ add_subdirectory(llmc)
 
 add_executable(train_gpt2c train_gpt2.c)
 add_executable(train_gpt2cu train_gpt2.cu)
+add_executable(train_gpt2_optimizedcu train_gpt2_optimized.cu)
 
 target_link_libraries(train_gpt2c PRIVATE llmc m)
 target_link_libraries(train_gpt2cu PRIVATE llmc m)
+target_link_libraries(train_gpt2_optimizedcu PRIVATE llmc m)
