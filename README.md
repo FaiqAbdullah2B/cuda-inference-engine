@@ -91,6 +91,57 @@ manually tracking tensor shapes through every layer until the architecture actua
 | Full pass + benchmarks vs naive |  Done |
 ---
 
+---
+
+### Benchmarks
+
+> `B = 1, C = 88, Words Gen = 24` (GPU runs); `B = 1, C = 768, Words Gen = 10` (CPU run)
+
+| Metric | CPU | Naive GPU | Optimized GPU |
+|---|---|---|---|
+| Total execution time | 22522.83 ms | 7322.66 ms | 330.08 ms |
+| Total compute time | 22519.08 ms | 7320.25 ms | 327.71 ms |
+| Avg time / word | 2252.28 ms | 305.11 ms | **13.75 ms** |
+| Avg time / forward pass | 2251.91 ms | 305.01 ms | **13.65 ms** |
+| Activations memory | 6 MB | 98 MB | 98 MB |
+| Half-precision memory | — | — | 78 MB |
+
+**Optimized GPU is ~22× faster than Naive GPU, and ~164× faster than CPU** *(note: CPU run used C = 768 vs C = 88 for GPU runs)*
+
+<details>
+<summary>Raw benchmark output</summary>
+
+```
+NAIVE GPU
+B = 1, T = 64 to 768, C = 88, Words Gen = 24
+Activations memory used: 98 MB
+Total execution time:          7322.656840 ms
+Allocation time overhead:         0.288876 ms
+Total GPU execution time:      7320.252472 ms
+Average time per word generation:  305.110702 ms
+Average time per GPU forward pass: 305.010520 ms
+
+OPTIMIZED GPU
+B = 1, T = 64 to 768, C = 88, Words Gen = 24
+Activations memory used: 98 MB
+Halfs memory used:       78 MB
+Total execution time:          330.084411 ms
+Allocation time overhead:        0.259933 ms
+Total GPU execution time:      327.711839 ms
+Average time per word generation:  13.753517 ms
+Average time per GPU forward pass: 13.654660 ms
+
+CPU
+B = 1, T = 8, C = 768, Words Gen = 10
+Activations memory used: 6 MB
+Total execution time:        22522.83 ms
+Allocation time overhead:        0.02 ms
+Total CPU execution time:    22519.08 ms
+Average time per word generation:  2252.28 ms
+Average time per forward pass:     2251.91 ms
+```
+
+</details>
 ## Running the Code
 
 ### Prerequisites
