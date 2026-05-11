@@ -6,6 +6,7 @@ extern "C" {
 #include "./llmc/rand.h"
 #include "./dev/cuda/utils.h"
 #include <math.h>
+#include <cuda_runtime.h>
 #include <mma.h>
 
 using namespace nvcuda;
@@ -373,65 +374,6 @@ __device__ void dot_product(float *out, float *a, float *b, int n) {
     }
 }
 
-__global__ void attention_forward_kernel(float *out, float *preatt_cache,
-                                         float *att_cache, float *inp, 
-                                         int B, int T, int C, int NH) {
-    int b = blockIdx.z * blockDim.z + threadIdx.z;
-    int t = blockIdx.y * blockDim.y + threadIdx.y;
-    int h = blockIdx.x * blockDim.x + threadIdx.x; // head index
-    
-    int C3 = C * 3;
-    int hs = C / NH;
-    float scale = 1.0 / sqrtf(hs);
-
-    if (b >= 0 && b < B && t >= 0 && t < T && h >= 0 && h < NH) {
-
-        float *queryt = inp + b * T * C3 + t * C3 + h * hs;
-        float maxVal = -1e20f;
-
-        int row_offset = b * (NH * T * T) + h * (T * T) + t * T; 
-        // masked preceding sequence of words only
-        // lots of control divergence here
-        for (int t2 = 0; t2 <= t; t2++) {
-            float *keyt = inp + b * T * C3 + t2 * C3 + h * hs + C;
-
-            // perform val = ((Q . K) / sqrt(hs))
-            float val = 0.0f;
-            dot_product(&val, queryt, keyt, hs);
-            val *= scale;
-
-            if (val > maxVal) {
-                maxVal = val;
-            }
-
-            preatt_cache[row_offset + t2] = val;
-        }
-
-        float exp_sum = 0.0f;
-        for (int t2 = 0; t2 <= t; t2++) {
-            // Subtract maxVal for numerical stability (Safe Softmax)
-            float e = expf(preatt_cache[row_offset + t2] - maxVal);
-            att_cache[row_offset + t2] = e;     // Store e^(Q.K)
-            exp_sum += e;          // Accumulate sum
-        }
-
-        int out_offset = b * T * C + t * C + h * hs;
-
-        for (int i = 0; i < hs; i++) {
-            out[out_offset + i] = 0.0f;
-        }
-
-        for (int t2 = 0; t2 <= t; t2++) {
-            float weight = att_cache[row_offset + t2] / exp_sum; // The actual Softmax score
-            float *valt = inp + b * T * C3 + t2 * C3 + h * hs + 2 * C; // Offset for V
-            // Accumulate into the output vector for this head/timestep
-            for (int i = 0; i < hs; i++) {
-                out[out_offset + i] += weight * valt[i];
-            }
-        }
-    }
-}
-
 __global__ void residual_forward_kernel(float *out, float *inp1, float *inp2, int N) {
     int i = (blockIdx.x * blockDim.x + threadIdx.x) * 4;
     if (i >= 0 && i <= N - 4) {
@@ -671,19 +613,159 @@ void matmul_forward(float *out, half* qkvi, half* qkvw,
 
 }
 
-void attention_forward(float *out, float *preatt_cache,
-                       float *att_cache, float *inp, 
-                       int B, int T, int C, int NH) {
-    const int blockSize_x = 32;
-    const int blockSize_y = 8;
-    const int blockSize_z = 1;
-    const int gridSize_x = CEIL_DIV(B, blockSize_z);
-    const int gridSize_y = CEIL_DIV(T, blockSize_y);
-    const int gridSize_z = CEIL_DIV(NH, blockSize_x);
-    dim3 gridDim = dim3(gridSize_x, gridSize_y, gridSize_z);
-    dim3 blockDim = dim3(blockSize_x, blockSize_y, blockSize_z);
-    attention_forward_kernel<<<gridDim, blockDim>>>(
-        out, preatt_cache, att_cache, inp, B, T, C, NH);
+// void attention_forward(float *out, float *preatt_cache,
+//                        float *att_cache, float *inp, 
+//                        int B, int T, int C, int NH) {
+//     const int blockSize_x = 32;
+//     const int blockSize_y = 8;
+//     const int blockSize_z = 1;
+//     const int gridSize_x = CEIL_DIV(NH, blockSize_x);
+//     const int gridSize_y = CEIL_DIV(T, blockSize_y);
+//     const int gridSize_z = CEIL_DIV(B, blockSize_z);
+//     dim3 gridDim = dim3(gridSize_x, gridSize_y, gridSize_z);
+//     dim3 blockDim = dim3(blockSize_x, blockSize_y, blockSize_z);
+//     attention_forward_kernel<<<gridDim, blockDim>>>(
+//         out, preatt_cache, att_cache, inp, B, T, C, NH);
+// }
+
+#include <cuda_runtime.h>
+#include <math.h>
+
+// because head size is 64
+#define BLOCK_SIZE 64
+
+__global__ void attention_forward_kernel(
+    float *out, float *preatt_cache, float *att_cache, float *inp,
+    int B, int T, int C, int NH) 
+{
+    int t = blockIdx.x;  
+    int h = blockIdx.y;  
+    int b = blockIdx.z; 
+    
+    int tid = threadIdx.x;
+    int hs = C / NH; 
+    
+    int batch_offset = b * T * 3 * C;
+    int query_offset = batch_offset + t * 3 * C + h * hs;
+    
+    extern __shared__ float smem[];
+    float* s_Q      = smem;                 // size: hs
+    float* s_reduce = smem + hs;            // size: BLOCK_SIZE
+    
+    const float* Q = inp + query_offset;
+    for (int i = tid; i < hs; i += blockDim.x) {
+        s_Q[i] = Q[i];
+    }
+    __syncthreads();
+    
+    float scale = 1.0f / sqrtf((float)hs);
+    int base_cache_idx = b * NH * T * T + h * T * T + t * T;
+
+    for (int t2 = 0; t2 <= t; t2++) {
+        int key_offset = batch_offset + t2 * 3 * C + C + h * hs;
+        const float* K = inp + key_offset;
+        
+        // Coalesced memory read into a partial dot product
+        float local_dot = 0.0f;
+        for (int i = tid; i < hs; i += blockDim.x) {
+            local_dot += s_Q[i] * K[i];
+        }
+        s_reduce[tid] = local_dot;
+        __syncthreads();
+        
+        // Shared Memory Tree Reduction for the dot product
+        for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+            if (tid < stride) {
+                s_reduce[tid] += s_reduce[tid + stride];
+            }
+            __syncthreads();
+        }
+        
+        // Write the reduced dot product to global memory pre-attention cache
+        if (tid == 0) {
+            preatt_cache[base_cache_idx + t2] = s_reduce[0] * scale;
+        }
+        __syncthreads(); 
+    }
+    
+    // Parallel Softmax Computation
+
+    float local_max = -1e20f;
+    for (int t2 = tid; t2 <= t; t2 += blockDim.x) {
+        float score = preatt_cache[base_cache_idx + t2];
+        if (score > local_max) local_max = score;
+    }
+    s_reduce[tid] = local_max;
+    __syncthreads();
+    
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            if (s_reduce[tid + stride] > s_reduce[tid]) s_reduce[tid] = s_reduce[tid + stride];
+        }
+        __syncthreads();
+    }
+    float block_max = s_reduce[0];
+    __syncthreads();
+    
+    // Compute exponentials and sum them
+    float local_sum = 0.0f;
+    for (int t2 = tid; t2 <= t; t2 += blockDim.x) {
+        float score = preatt_cache[base_cache_idx + t2];
+        float ex = expf(score - block_max);
+        att_cache[base_cache_idx + t2] = ex;
+        local_sum += ex;
+    }
+    s_reduce[tid] = local_sum;
+    __syncthreads();
+    
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            s_reduce[tid] += s_reduce[tid + stride];
+        }
+        __syncthreads();
+    }
+    float block_sum = s_reduce[0];
+    __syncthreads();
+    
+    for (int t2 = tid; t2 < T; t2 += blockDim.x) {
+        if (t2 <= t) {
+            att_cache[base_cache_idx + t2] /= block_sum;
+        } else {
+            // Mask future tokens 
+            preatt_cache[base_cache_idx + t2] = -1e20f; 
+            att_cache[base_cache_idx + t2] = 0.0f;
+        }
+    }
+    __syncthreads(); 
+    
+    // Compute Output (Attention Weights * Value)
+    int out_offset = b * T * C + t * C + h * hs;
+    for (int i = tid; i < hs; i += blockDim.x) {
+        float out_val = 0.0f;
+        for (int t2 = 0; t2 <= t; t2++) {
+            float att = att_cache[base_cache_idx + t2];
+            int val_offset = batch_offset + t2 * 3 * C + 2 * C + h * hs;
+            const float* V = inp + val_offset;
+            out_val += att * V[i];
+        }
+        out[out_offset + i] = out_val;
+    }
+}
+
+void attention_forward(float *out, float *preatt_cache, float *att_cache, float *inp, int B, int T, int C, int NH) {
+    dim3 grid(T, NH, B);
+    dim3 block(BLOCK_SIZE);
+    
+    // Head size
+    int hs = C / NH;
+    
+    // Shared memory needs 'hs' size floats for querying cache + BLOCK_SIZE floats for tree reduction
+    size_t shared_mem_bytes = (hs + BLOCK_SIZE) * sizeof(float);
+    
+    attention_forward_kernel<<<grid, block, shared_mem_bytes>>>(
+        out, preatt_cache, att_cache, inp, B, T, C, NH
+    );
+    
 }
 
 void residual_forward(float *out, float *inp1, float *inp2, int N) {
@@ -975,8 +1057,12 @@ void gpt2_forward(GPT2 *model, int *inputs, int *targets, int B, int T,
         layernorm_forward(l_ln2, l_residual2, l_ln2w, l_ln2b, B, T, C);
         matmul_forward(l_fch, halfs.matrix_a, halfs.matrix_b, l_ln2, l_fcw, l_fcb, B, T, C, 4*C);
         gelu_forward(l_fch_gelu, l_fch, B*T*4*C);
-        matmul_forward(l_fcproj, halfs.matrix_a, halfs.matrix_b, l_fch_gelu, l_fcprojw, l_fcprojb, B, T, 4*C, C);
-        residual_forward(l_residual3, l_residual2, l_fcproj, B*T*C);
+        matmul_forward(l_fcproj, halfs.matrix_a, halfs.matrix_b, l_fch_gelu, l_fcprojw, l_fcprojb, B, T,
+                       4*C,
+                       C);
+        residual_forward(l_residual3, l_residual2,
+                         l_fcproj,
+                         B * T * C);
     }
     residual = acts.residual3 + (L-1) * B * T * C;
     layernorm_forward(acts.lnf, residual, params.lnfw, params.lnfb, B, T, C);
