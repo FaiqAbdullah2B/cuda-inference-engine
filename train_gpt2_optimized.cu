@@ -60,10 +60,11 @@ typedef struct {
     float *probs; // (B, T, V)
 } ActivationTensors;
 
-#define NUM_HALF_TENSORS 2
+#define NUM_HALF_TENSORS 3
 typedef struct {
-    half *qkvi;
-    half *qkvw;
+    half *matrix_a;   // largest input size
+    half *matrix_b;   // largest weights size
+    half *wte;        // wte has a fixed size of Vp * C
 } HalfTensors;
 
 typedef struct {
@@ -140,15 +141,18 @@ void init_activation_sizes(size_t *act_sizes, int B, int T, GPT2Config config) {
 void init_half_sizes(size_t *half_sizes, int B, int T, GPT2Config config) {
     size_t L = config.num_layers;
     size_t C = config.channels;
-    half_sizes[0] = L * B * T * C;      // layernorm 1 (qkvi)
-    half_sizes[1] = L * (3 * C) * C;    // qkvw
+    size_t Vp = config.padded_vocab_size;
+
+    half_sizes[0] = B * T * 4 * C;      // largest inputs
+    half_sizes[1] = (4 * C) * C;        // largest weights
+    half_sizes[2] = Vp * C;             // wte
 }
 
 // kernels
 #define ENCODER_BLOCK_DIM_Y 16
 __global__ void encoder_forward_kernel(float *out,
                                        int *inp, float *wte, float *wpe,
-                                       int B, int T, int C) {
+                                       int B, int T, int C, int position_offset) {
     int b = blockIdx.z * blockDim.z + threadIdx.z; // depth
     int t = blockIdx.y * blockDim.y + threadIdx.y; // row
     int c = (blockIdx.x * blockDim.x + threadIdx.x) * 4; // col
@@ -165,9 +169,11 @@ __global__ void encoder_forward_kernel(float *out,
     __syncthreads();
     
     if (b >= 0 && b < B && t >= 0 && t < T && c >= 0 && c < C) {
+        int pos = t + position_offset;
+
         // using float4 to reduce 12 accesses per 4 values to just 3 accesses
         float4 *wte_vec = (float4*)(&wte[token_ids[threadIdx.y] * C + c]);
-        float4 *wpe_vec = (float4*)(&wpe[t * C + c]);
+        float4 *wpe_vec = (float4*)(&wpe[pos * C + c]);
 
         float4 wte_val = *wte_vec;
         float4 wpe_val = *wpe_vec;
@@ -278,7 +284,7 @@ __global__ void matmul_forward_kernel(float *out,
     int tid = threadIdx.y * blockDim.x + threadIdx.x; // exact thread within a block 0 - 127
 
     __shared__ half inp_s[TS * 2][TS];
-    __shared__ half weight_s[TS][TS * 2];
+    __shared__ half weight_s[TS * 2][TS];
 
     int block_row_start = blockIdx.y * 32;
     int block_col_start = blockIdx.x * 32;
@@ -310,30 +316,28 @@ __global__ void matmul_forward_kernel(float *out,
         }
 
         // weight is N x K not K x N, so each column is K elements long
+        // Map 'r' to N, and 'c' to K
         for (int i = 0; i < 4; i++) {
             int load_idx = tid + (i * 128);
-            int r = load_idx / 32; // K dimension
-            int c = load_idx % 32; // N dimension
+            int r = load_idx / 16; // N dimension (0 to 31)
+            int c = load_idx % 16; // K dimension (0 to 15)
 
-            int global_k = k + c; 
-            // block col start is quite confusing for this.
-            int global_n = block_col_start + r; // starting N + r
+            int global_n = block_col_start + r; // N + r
+            int global_k = k + c;
 
-            if (global_k < K && global_n < N) {
+            if (global_n < N && global_k < K) {
                 weight_s[r][c] = weight[global_n * K + global_k];
             } else {
-                weight_s[r][c] = 0.0f; // Pad with zero
+                weight_s[r][c] = 0.0f; 
             }
         }
         __syncthreads();
 
-        // point to the start
         half *a_ptr = &inp_s[(threadIdx.y / 2) * 16][0];
-        half *b_ptr = &weight_s[0][(threadIdx.y % 2) * 16];
+        half *b_ptr = &weight_s[(threadIdx.y % 2) * 16][0];
 
         wmma::load_matrix_sync(a_frag, a_ptr, 16);
-        wmma::load_matrix_sync(b_frag, b_ptr, 32);
-
+        wmma::load_matrix_sync(b_frag, b_ptr, 16);
         wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
 
         __syncthreads();
@@ -358,7 +362,74 @@ __global__ void matmul_forward_kernel(float *out,
             int cur_col = global_warp_col + c;
 
             if (cur_row < M && cur_col < N) {
-                c_ptr[r * N + c] += bias[cur_col];
+                if (bias != NULL) {
+                    c_ptr[r * N + c] += bias[cur_col];
+                }
+            }
+        }
+    }
+}
+
+__device__ void dot_product(float *out, float *a, float *b, int n) {
+    for (int i = 0; i < n; i++) {
+        *out += a[i] * b[i];
+    }
+}
+
+__global__ void attention_forward_kernel(float *out, float *preatt_cache,
+                                         float *att_cache, float *inp, 
+                                         int B, int T, int C, int NH) {
+    int b = blockIdx.z * blockDim.z + threadIdx.z;
+    int t = blockIdx.y * blockDim.y + threadIdx.y;
+    int h = blockIdx.x * blockDim.x + threadIdx.x; // head index
+    
+    int C3 = C * 3;
+    int hs = C / NH;
+    float scale = 1.0 / sqrtf(hs);
+
+    if (b >= 0 && b < B && t >= 0 && t < T && h >= 0 && h < NH) {
+
+        float *queryt = inp + b * T * C3 + t * C3 + h * hs;
+        float maxVal = -1e20f;
+
+        int row_offset = b * (NH * T * T) + h * (T * T) + t * T; 
+        // masked preceding sequence of words only
+        // lots of control divergence here
+        for (int t2 = 0; t2 <= t; t2++) {
+            float *keyt = inp + b * T * C3 + t2 * C3 + h * hs + C;
+
+            // perform val = ((Q . K) / sqrt(hs))
+            float val = 0.0f;
+            dot_product(&val, queryt, keyt, hs);
+            val *= scale;
+
+            if (val > maxVal) {
+                maxVal = val;
+            }
+
+            preatt_cache[row_offset + t2] = val;
+        }
+
+        float exp_sum = 0.0f;
+        for (int t2 = 0; t2 <= t; t2++) {
+            // Subtract maxVal for numerical stability (Safe Softmax)
+            float e = expf(preatt_cache[row_offset + t2] - maxVal);
+            att_cache[row_offset + t2] = e;     // Store e^(Q.K)
+            exp_sum += e;          // Accumulate sum
+        }
+
+        int out_offset = b * T * C + t * C + h * hs;
+
+        for (int i = 0; i < hs; i++) {
+            out[out_offset + i] = 0.0f;
+        }
+
+        for (int t2 = 0; t2 <= t; t2++) {
+            float weight = att_cache[row_offset + t2] / exp_sum; // The actual Softmax score
+            float *valt = inp + b * T * C3 + t2 * C3 + h * hs + 2 * C; // Offset for V
+            // Accumulate into the output vector for this head/timestep
+            for (int i = 0; i < hs; i++) {
+                out[out_offset + i] += weight * valt[i];
             }
         }
     }
@@ -451,7 +522,7 @@ __global__ void softmax_forward_kernel(float *probs, float *logits,
     // Calculate Max
     // 1024 threads * 4 = 4096 elements processed per loop iteration
     for (int i = threadIdx.x * 4; i < V; i += blockDim.x * 4) {
-        if (i <= Vp - 4) {
+        if (i <= V - 4) {
             float4 logits_val = *(float4 *)&logits[row_idx * Vp + i];
             // maxval is only calculated and subtracted for numerical stability
             logits_val.x /= TEMPERATURE;
@@ -545,7 +616,7 @@ __global__ void softmax_forward_kernel(float *probs, float *logits,
 // kernel launchers
 void encoder_forward(float *out,
                     int *inp, float *wte, float *wpe,
-                    int B, int T, int C) {
+                    int B, int T, int C, int position_offset) {
     int blockDim_z = 1;
     int blockDim_y = ENCODER_BLOCK_DIM_Y;
     int blockDim_x = 32;
@@ -554,7 +625,8 @@ void encoder_forward(float *out,
     int gridDim_x = CEIL_DIV(C, blockDim_x * 4);
     dim3 blockDim = dim3(blockDim_x, blockDim_y, blockDim_z);
     dim3 gridDim = dim3(gridDim_x, gridDim_y, gridDim_z);
-    encoder_forward_kernel<<<gridDim, blockDim>>>(out, inp, wte, wpe, B, T, C);
+    encoder_forward_kernel<<<gridDim, blockDim>>>(
+        out, inp, wte, wpe, B, T, C, position_offset);
     cudaCheck(cudaGetLastError());
 }
 
@@ -600,6 +672,21 @@ void matmul_forward(float *out, half* qkvi, half* qkvw,
         out, qkvi, qkvw, bias, B, T, C, OC);
     cudaCheck(cudaGetLastError());
 
+}
+
+void attention_forward(float *out, float *preatt_cache,
+                       float *att_cache, float *inp, 
+                       int B, int T, int C, int NH) {
+    const int blockSize_z = 32;
+    const int blockSize_y = 8;
+    const int blockSize_x = 1;
+    const int gridSize_z = CEIL_DIV(B, blockSize_z);
+    const int gridSize_y = CEIL_DIV(T, blockSize_y);
+    const int gridSize_x = CEIL_DIV(NH, blockSize_x);
+    dim3 gridDim = dim3(gridSize_x, gridSize_y, gridSize_z);
+    dim3 blockDim = dim3(blockSize_x, blockSize_y, blockSize_z);
+    attention_forward_kernel<<<gridDim, blockDim>>>(
+        out, preatt_cache, att_cache, inp, B, T, C, NH);
 }
 
 void residual_forward(float *out, float *inp1, float *inp2, int N) {
@@ -703,7 +790,7 @@ half* malloc_and_point_halfs(HalfTensors* halfs, const size_t* half_sizes) {
     );
 
     half **ptrs[] = {
-        &halfs->qkvi, &halfs->qkvw
+        &halfs->matrix_a, &halfs->matrix_b, &halfs->wte
     };
 
     half *halfs_memory_iterator = halfs_memory;
@@ -762,7 +849,8 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
     model->mean_loss = -1.0f; // -1.0f will designate no loss
 }
 
-void gpt2_forward(GPT2 *model, int *inputs, int *targets, int B, int T) {
+void gpt2_forward(GPT2 *model, int *inputs, int *targets, int B, int T, 
+                  int position_offset) {
     if (model->params_memory == NULL) {
         printf("Error: model was not initialized properly.\n");
         exit(EXIT_FAILURE);
@@ -778,22 +866,6 @@ void gpt2_forward(GPT2 *model, int *inputs, int *targets, int B, int T) {
         assert(0 <= inputs[i] && inputs[i] < V);
         if (targets != NULL) {
             assert(0 <= targets[i] && targets[i] < V);
-        }
-    }
-
-    if (model->acts_memory != NULL) {
-        if (B != model->batch_size || T != model->seq_len) {
-            cudaFree(model->acts_memory);
-            cudaFree(model->inputs);
-            cudaFree(model->targets);
-            model->acts_memory = NULL;
-        }
-    }
-
-    if (model->halfs_memory != NULL) {
-        if (B != model->batch_size || T != model->seq_len) {
-            cudaFree(model->halfs_memory);
-            model->halfs_memory = NULL;
         }
     }
 
@@ -863,84 +935,94 @@ void gpt2_forward(GPT2 *model, int *inputs, int *targets, int B, int T) {
     ActivationTensors acts = model->acts;
     HalfTensors halfs = model->halfs;
     float *residual;
-    float *intermediate = (float *)malloc(B * T * 4 * C * sizeof(float));
+    encoder_forward(acts.encoded, model->inputs, params.wte, params.wpe, B, T, C, position_offset);
+    for (int l = 0; l < L; l++) {
+        residual = l == 0 ? acts.encoded : acts.residual3 + (l-1) * B * T * C;
 
-    cudaEvent_t start, stop;
-    cudaEventCreate(&start);
-    cudaEventCreate(&stop);
+        // pointers of parameters
+        float *l_ln1w = params.ln1w + l * C;
+        float *l_ln1b = params.ln1b + l * C;
+        float *l_qkvw = params.qkvw + l * 3*C * C;
+        float *l_qkvb = params.qkvb + l * 3*C;
+        float *l_attprojw = params.attprojw + l * C * C;
+        float *l_attprojb = params.attprojb + l * C;
+        float *l_ln2w = params.ln2w + l * C;
+        float *l_ln2b = params.ln2b + l * C;
+        float *l_fcw = params.fcw + l * 4*C * C;
+        float *l_fcb = params.fcb + l * 4*C;
+        float *l_fcprojw = params.fcprojw + l * C * 4*C;
+        float *l_fcprojb = params.fcprojb + l * C;
 
-    cudaEventRecord(start);
-    encoder_forward(acts.encoded, model->inputs, params.wte, params.wpe, B, T, C);
-    cudaEventRecord(stop);
-    cudaEventSynchronize(stop);
+        // pointers of activations
+        float *l_ln1 = acts.ln1 + l * B * T * C;
+        float *l_qkv = acts.qkv + l * B * T * 3*C;
+        float *l_atty = acts.atty + l * B * T * C;
+        float *l_preatt = acts.preatt + l * B * NH * T * T;
+        float *l_att = acts.att + l * B * NH * T * T;
+        float *l_attproj = acts.attproj + l * B * T * C;
+        float *l_residual2 = acts.residual2 + l * B * T * C;
+        float *l_ln2 = acts.ln2 + l * B * T * C;
+        float *l_fch = acts.fch + l * B * T * 4*C;
+        float *l_fch_gelu = acts.fch_gelu + l * B * T * 4*C;
+        float *l_fcproj = acts.fcproj + l * B * T * C;
+        float *l_residual3 = acts.residual3 + l * B * T * C;
 
-    float milliseconds = 0.0f;
-
-    cudaEventElapsedTime(&milliseconds, start, stop);
-    printf("Encoder time taken: %f ms\n", milliseconds);
-
-    cudaEventRecord(start);
-    layernorm_forward(acts.ln1, acts.encoded, params.ln1w, params.ln1b, B, T, C);
-    cudaEventRecord(stop);
-    cudaEventSynchronize(stop);
-
-    milliseconds = 0.0f;
-
-    cudaEventElapsedTime(&milliseconds, start, stop);
-    printf("Layernorm time taken: %f ms\n", milliseconds);
-
-    cudaEventRecord(start);
-    matmul_forward(acts.qkv, halfs.qkvi, halfs.qkvw, acts.ln1, params.qkvw, params.qkvb, B, T, C, 3 * C);
-    cudaEventRecord(stop);
-    cudaEventSynchronize(stop);
-
-    milliseconds = 0.0f;
-
-    cudaEventElapsedTime(&milliseconds, start, stop);
-    printf("QKV time taken: %f ms\n", milliseconds);
-
-    cudaMemcpy(intermediate, acts.qkv, B * T * C * sizeof(float), cudaMemcpyDeviceToHost);
-
-    printf("=================== QKV output ==================\n");
-    for (int i = 0; i < B * T; i++) {
-        printf("%f ", intermediate[i]);
-        if ((i + 1) % 100 == 0) {
-            printf("\n");
-        }
+        layernorm_forward(l_ln1, residual, l_ln1w, l_ln1b, B, T, C);
+        matmul_forward(l_qkv, halfs.matrix_a, halfs.matrix_b, l_ln1, l_qkvw, l_qkvb, B, T, C, 3 * C);
+        attention_forward(l_atty, l_preatt, l_att, l_qkv, B, T, C, NH);
+        matmul_forward(l_attproj, halfs.matrix_a, halfs.matrix_b, l_atty, l_attprojw, l_attprojb, B, T, C, C);
+        residual_forward(l_residual2, residual, l_attproj, B*T*C);
+        layernorm_forward(l_ln2, l_residual2, l_ln2w, l_ln2b, B, T, C);
+        matmul_forward(l_fch, halfs.matrix_a, halfs.matrix_b, l_ln2, l_fcw, l_fcb, B, T, C, 4*C);
+        gelu_forward(l_fch_gelu, l_fch, B*T*4*C);
+        matmul_forward(l_fcproj, halfs.matrix_a, halfs.matrix_b, l_fch_gelu, l_fcprojw, l_fcprojb, B, T, 4*C, C);
+        residual_forward(l_residual3, l_residual2, l_fcproj, B*T*C);
     }
-    printf("\n");
-
-    cudaEventDestroy(start);
-    cudaEventDestroy(stop);
+    residual = acts.residual3 + (L-1) * B * T * C;
+    layernorm_forward(acts.lnf, residual, params.lnfw, params.lnfb, B, T, C);
+    matmul_forward(acts.logits, halfs.matrix_a, halfs.wte, acts.lnf, params.wte, NULL, B, T, C, Vp);
+    softmax_forward(acts.probs, acts.logits, B, T, V, Vp);
 }
 
 void generate_text(GPT2 *model, Tokenizer *tokenizer, int *prompt_tokens, int B, int T, int max_new_tokens) {
-    int current_len = B * T;
+    // initial prompt
+    printf("Prompt: ");
+    for (int i = 0; i < B * T; i++) {
+        if (tokenizer->init_ok) {
+            printf("%s", tokenizer_decode(tokenizer, prompt_tokens[i]));
+        } else {
+            // Fallback if tokenizer failed to load
+            printf("%d ", prompt_tokens[i]);
+        }
+    }
+    printf("\n--- Generating ---\n");
 
-    // Allocate a buffer large enough for the prompt + generated tokens
-    int total_capacity = current_len + max_new_tokens;
-    int *sequence = (int*)malloc(total_capacity * sizeof(int));
-    memcpy(sequence, prompt_tokens, B * T * sizeof(int));
+    // Allocate a fixed-size buffer for the sliding context window
+    int *window_tokens = (int*)malloc(B * T * sizeof(int));
+    memcpy(window_tokens, prompt_tokens, B * T * sizeof(int));
 
-    float *h_probs = (float*)malloc(model->config.vocab_size * sizeof(float));
+    int V = model->config.vocab_size;
+    int Vp = model->config.padded_vocab_size;
+    float *h_probs = (float*)malloc(V * sizeof(float));
 
+    // to account for the changing positional encoding positions due to
+    // sliding window
+    int position_offset = 0;
     for (int i = 0; i < max_new_tokens; i++) {
-        gpt2_forward(model, sequence, NULL, 1, current_len);
+        gpt2_forward(model, window_tokens, NULL, B, T, position_offset);
 
-        // get the softmax probabilities for the generated sequence
-        float *d_last_probs = model->acts.probs + (current_len - 1) * model->config.padded_vocab_size;
+        int b = 0;
+        float *d_last_probs = model->acts.probs + (b * T * Vp) + ((T - 1) * Vp);
 
-        // copy the probabilities to host
         cudaMemcpy(h_probs, d_last_probs, 
-                   model->config.vocab_size * sizeof(float),
+                   V * sizeof(float),
                    cudaMemcpyDeviceToHost);
 
-        // Multinomial sampling
         float coin_flip = (float)rand() / (float)RAND_MAX;
         float cdf = 0.0f;
-        int next_token = model->config.vocab_size - 1; // Safe fallback
+        int next_token = V - 1;
         
-        for (int v = 0; v < model->config.vocab_size; v++) {
+        for (int v = 0; v < V; v++) {
             cdf += h_probs[v];
             if (coin_flip < cdf) {
                 next_token = v;
@@ -948,16 +1030,23 @@ void generate_text(GPT2 *model, Tokenizer *tokenizer, int *prompt_tokens, int B,
             }
         }
 
-        // append the picked token and increment current_len by 1
-        sequence[current_len] = next_token;
-        current_len++;
+        if (tokenizer->init_ok) {
+            printf("%s", tokenizer_decode(tokenizer, next_token));
+        } else {
+            printf("%d ", next_token);
+        }
+        fflush(stdout);
 
-        printf("%s", tokenizer_decode(tokenizer, next_token));
+        for (int t = 0; t < T - 1; t++) {
+            window_tokens[b * T + t] = window_tokens[b * T + t + 1];
+        }
+
+        window_tokens[b * T + (T - 1)] = next_token;
     }
     
     printf("\n");
     free(h_probs);
-    free(sequence);
+    free(window_tokens);
 }
 
 void gpt2_free(GPT2 *model) {
@@ -972,7 +1061,7 @@ int main() {
     gpt2_build_from_checkpoint(&model, "../gpt2_124M.bin");
 
     const char* tiny_shake_train = "../dev/data/tinyshakespeare/tiny_shakespeare_train.bin";
-    int B = 24;
+    int B = 1;
     int T = 256;
     Dataloader train_loader;
     dataloader_init(&train_loader, tiny_shake_train, B, T);
@@ -980,8 +1069,14 @@ int main() {
     Tokenizer tokenizer;
     tokenizer_init(&tokenizer, "../gpt2_tokenizer.bin");
 
+    srand(112233);
+
     dataloader_next_batch(&train_loader);
-    gpt2_forward(&model, train_loader.inputs, train_loader.targets, B, T);
+    dataloader_next_batch(&train_loader);
+    dataloader_next_batch(&train_loader);
+    dataloader_next_batch(&train_loader);
+
+    generate_text(&model, &tokenizer, train_loader.inputs, B, T, 100);
 
     dataloader_free(&train_loader);
     tokenizer_free(&tokenizer);
