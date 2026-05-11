@@ -95,7 +95,7 @@ manually tracking tensor shapes through every layer until the architecture actua
 
 ### Benchmarks
 
-> `B = 1, C = 88, Words Gen = 24` (GPU runs); `B = 1, C = 768, Words Gen = 10` (CPU run)
+> `B = 1, T = 64 - 88, C = 768, Words Gen = 24` (GPU runs); `B = 1, T = 8, C = 768, Words Gen = 10` (CPU run)
 
 | Metric | CPU | Naive GPU | Optimized GPU |
 |---|---|---|---|
@@ -113,7 +113,7 @@ manually tracking tensor shapes through every layer until the architecture actua
 
 ```
 NAIVE GPU
-B = 1, T = 64 to 768, C = 88, Words Gen = 24
+B = 1, T = 64 to 88, C = 768, Words Gen = 24
 Activations memory used: 98 MB
 Total execution time:          7322.656840 ms
 Allocation time overhead:         0.288876 ms
@@ -122,7 +122,7 @@ Average time per word generation:  305.110702 ms
 Average time per GPU forward pass: 305.010520 ms
 
 OPTIMIZED GPU
-B = 1, T = 64 to 768, C = 88, Words Gen = 24
+B = 1, T = 64 to 88, C = 768, Words Gen = 24
 Activations memory used: 98 MB
 Halfs memory used:       78 MB
 Total execution time:          330.084411 ms
