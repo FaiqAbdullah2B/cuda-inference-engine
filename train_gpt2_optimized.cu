@@ -87,6 +87,7 @@ typedef struct {
 
     int batch_size; // B
     int seq_len; // T
+    int max_seq_len; // for position encoding, also T for training but can be different for inference
     int *inputs;
     int *targets;
     float mean_loss;
@@ -152,7 +153,7 @@ void init_half_sizes(size_t *half_sizes, int B, int T, GPT2Config config) {
 #define ENCODER_BLOCK_DIM_Y 16
 __global__ void encoder_forward_kernel(float *out,
                                        int *inp, float *wte, float *wpe,
-                                       int B, int T, int C, int position_offset) {
+                                       int B, int T, int C) {
     int b = blockIdx.z * blockDim.z + threadIdx.z; // depth
     int t = blockIdx.y * blockDim.y + threadIdx.y; // row
     int c = (blockIdx.x * blockDim.x + threadIdx.x) * 4; // col
@@ -169,11 +170,9 @@ __global__ void encoder_forward_kernel(float *out,
     __syncthreads();
     
     if (b >= 0 && b < B && t >= 0 && t < T && c >= 0 && c < C) {
-        int pos = t + position_offset;
-
         // using float4 to reduce 12 accesses per 4 values to just 3 accesses
         float4 *wte_vec = (float4*)(&wte[token_ids[threadIdx.y] * C + c]);
-        float4 *wpe_vec = (float4*)(&wpe[pos * C + c]);
+        float4 *wpe_vec = (float4*)(&wpe[t * C + c]);
 
         float4 wte_val = *wte_vec;
         float4 wpe_val = *wpe_vec;
@@ -271,7 +270,6 @@ __global__ void float_to_half_kernel(half* out, const float* in, int size) {
     }
 }
 
-// UNDERSTAND THIS or revert this
 #define TS 16
 // M x K * K x N Matmul
 __global__ void matmul_forward_kernel(float *out,
@@ -616,7 +614,7 @@ __global__ void softmax_forward_kernel(float *probs, float *logits,
 // kernel launchers
 void encoder_forward(float *out,
                     int *inp, float *wte, float *wpe,
-                    int B, int T, int C, int position_offset) {
+                    int B, int T, int C) {
     int blockDim_z = 1;
     int blockDim_y = ENCODER_BLOCK_DIM_Y;
     int blockDim_x = 32;
@@ -626,7 +624,7 @@ void encoder_forward(float *out,
     dim3 blockDim = dim3(blockDim_x, blockDim_y, blockDim_z);
     dim3 gridDim = dim3(gridDim_x, gridDim_y, gridDim_z);
     encoder_forward_kernel<<<gridDim, blockDim>>>(
-        out, inp, wte, wpe, B, T, C, position_offset);
+        out, inp, wte, wpe, B, T, C);
     cudaCheck(cudaGetLastError());
 }
 
@@ -847,11 +845,12 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
     model->targets = NULL;
     model->batch_size = 0;
     model->seq_len = 0;
+    model->max_seq_len = 0;
     model->mean_loss = -1.0f; // -1.0f will designate no loss
 }
 
 void gpt2_forward(GPT2 *model, int *inputs, int *targets, int B, int T, 
-                  int position_offset) {
+                  int additional) {
     if (model->params_memory == NULL) {
         printf("Error: model was not initialized properly.\n");
         exit(EXIT_FAILURE);
@@ -873,8 +872,9 @@ void gpt2_forward(GPT2 *model, int *inputs, int *targets, int B, int T,
     if (model->acts_memory == NULL) {
         model->batch_size = B;
         model->seq_len = T;
+        model->max_seq_len = T + additional;
 
-        init_activation_sizes(model->act_sizes, B, T, model->config);
+        init_activation_sizes(model->act_sizes, B, model->max_seq_len, model->config);
 
         size_t num_activations = 0;
         for (size_t i = 0; i < NUM_ACTIVATION_TENSORS; i++) {
@@ -888,18 +888,18 @@ void gpt2_forward(GPT2 *model, int *inputs, int *targets, int B, int T,
             (num_activations * sizeof(float)) >> 20);
         
         // also create memory for caching inputs and targets
-        cudaCheck(cudaMalloc((void**)&model->inputs, B * T * sizeof(int)));
-        cudaCheck(cudaMalloc((void**)&model->targets, B * T * sizeof(int)));
+        cudaCheck(cudaMalloc((void**)&model->inputs, B * model->max_seq_len * sizeof(int)));
+        cudaCheck(cudaMalloc((void**)&model->targets, B * model->max_seq_len * sizeof(int)));
     }
     else {
-        if (B != model->batch_size || T != model->seq_len) {
-            printf("Model: B=%d T=%d, Desired: B=%d T=%d\n", model->batch_size, model->seq_len, B, T);
+        if (B > model->batch_size || T > model->max_seq_len) {
+            printf("Model: B=%d T=%d, Desired: B=%d T=%d\n", model->batch_size, model->max_seq_len, B, T);
             exit(EXIT_FAILURE);
         }
     }
 
     if (model->halfs_memory == NULL) {
-        init_half_sizes(model->half_sizes, B, T, model->config);
+        init_half_sizes(model->half_sizes, B, model->max_seq_len, model->config);
 
         size_t num_halfs = 0;
         for (size_t i = 0; i < NUM_HALF_TENSORS; i++) {
@@ -913,8 +913,8 @@ void gpt2_forward(GPT2 *model, int *inputs, int *targets, int B, int T,
             (num_halfs * sizeof(half)) >> 20);
     }
     else {
-        if (B != model->batch_size || T != model->seq_len) {
-            printf("Model: B=%d T=%d, Desired: B=%d T=%d\n", model->batch_size, model->seq_len, B, T);
+        if (B > model->batch_size || T > model->max_seq_len) {
+            printf("Model: B=%d T=%d, Desired: B=%d T=%d\n", model->batch_size, model->max_seq_len, B, T);
             exit(EXIT_FAILURE);
         }
     }
@@ -936,7 +936,7 @@ void gpt2_forward(GPT2 *model, int *inputs, int *targets, int B, int T,
     ActivationTensors acts = model->acts;
     HalfTensors halfs = model->halfs;
     float *residual;
-    encoder_forward(acts.encoded, model->inputs, params.wte, params.wpe, B, T, C, position_offset);
+    encoder_forward(acts.encoded, model->inputs, params.wte, params.wpe, B, T, C);
     for (int l = 0; l < L; l++) {
         residual = l == 0 ? acts.encoded : acts.residual3 + (l-1) * B * T * C;
 
@@ -986,44 +986,38 @@ void gpt2_forward(GPT2 *model, int *inputs, int *targets, int B, int T,
 }
 
 void generate_text(GPT2 *model, Tokenizer *tokenizer, int *prompt_tokens, int B, int T, int max_new_tokens) {
-    // initial prompt
-    printf("Prompt: ");
+    int current_len = B * T;
+
+    // Allocate a buffer large enough for the prompt + generated tokens
+    int total_capacity = current_len + max_new_tokens;
+    int *sequence = (int*)malloc(total_capacity * sizeof(int));
+    memcpy(sequence, prompt_tokens, B * T * sizeof(int));
+
+    float *h_probs = (float*)malloc(model->config.vocab_size * sizeof(float));
+
+    printf("--- PROMPT ---\n");
     for (int i = 0; i < B * T; i++) {
-        if (tokenizer->init_ok) {
-            printf("%s", tokenizer_decode(tokenizer, prompt_tokens[i]));
-        } else {
-            // Fallback if tokenizer failed to load
-            printf("%d ", prompt_tokens[i]);
-        }
+        printf("%s", tokenizer_decode(tokenizer, prompt_tokens[i])); 
     }
-    printf("\n--- Generating ---\n");
+    printf("\n--- GENERATION ---\n");
 
-    // Allocate a fixed-size buffer for the sliding context window
-    int *window_tokens = (int*)malloc(B * T * sizeof(int));
-    memcpy(window_tokens, prompt_tokens, B * T * sizeof(int));
-
-    int V = model->config.vocab_size;
-    int Vp = model->config.padded_vocab_size;
-    float *h_probs = (float*)malloc(V * sizeof(float));
-
-    // to account for the changing positional encoding positions due to
-    // sliding window
-    int position_offset = 0;
     for (int i = 0; i < max_new_tokens; i++) {
-        gpt2_forward(model, window_tokens, NULL, B, T, position_offset);
+        gpt2_forward(model, sequence, NULL, 1, current_len, max_new_tokens - i);
 
-        int b = 0;
-        float *d_last_probs = model->acts.probs + (b * T * Vp) + ((T - 1) * Vp);
+        // get the softmax probabilities for the generated sequence
+        float *d_last_probs = model->acts.probs + (current_len - 1) * model->config.padded_vocab_size;
 
+        // copy the probabilities to host
         cudaMemcpy(h_probs, d_last_probs, 
-                   V * sizeof(float),
+                   model->config.vocab_size * sizeof(float),
                    cudaMemcpyDeviceToHost);
 
+        // Multinomial sampling
         float coin_flip = (float)rand() / (float)RAND_MAX;
         float cdf = 0.0f;
-        int next_token = V - 1;
+        int next_token = model->config.vocab_size - 1; // Safe fallback
         
-        for (int v = 0; v < V; v++) {
+        for (int v = 0; v < model->config.vocab_size; v++) {
             cdf += h_probs[v];
             if (coin_flip < cdf) {
                 next_token = v;
@@ -1031,23 +1025,16 @@ void generate_text(GPT2 *model, Tokenizer *tokenizer, int *prompt_tokens, int B,
             }
         }
 
-        if (tokenizer->init_ok) {
-            printf("%s", tokenizer_decode(tokenizer, next_token));
-        } else {
-            printf("%d ", next_token);
-        }
-        fflush(stdout);
+        // append the picked token and increment current_len by 1
+        sequence[current_len] = next_token;
+        current_len++;
 
-        for (int t = 0; t < T - 1; t++) {
-            window_tokens[b * T + t] = window_tokens[b * T + t + 1];
-        }
-
-        window_tokens[b * T + (T - 1)] = next_token;
+        printf("%s", tokenizer_decode(tokenizer, next_token));
     }
     
     printf("\n");
     free(h_probs);
-    free(window_tokens);
+    free(sequence);
 }
 
 void gpt2_free(GPT2 *model) {
@@ -1070,14 +1057,14 @@ int main() {
     Tokenizer tokenizer;
     tokenizer_init(&tokenizer, "../gpt2_tokenizer.bin");
 
-    srand(112233);
+    srand(time(NULL));
 
     dataloader_next_batch(&train_loader);
     dataloader_next_batch(&train_loader);
     dataloader_next_batch(&train_loader);
     dataloader_next_batch(&train_loader);
 
-    generate_text(&model, &tokenizer, train_loader.inputs, B, T, 100);
+    generate_text(&model, &tokenizer, train_loader.inputs, B, T, 256);
 
     dataloader_free(&train_loader);
     tokenizer_free(&tokenizer);
