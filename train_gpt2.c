@@ -8,6 +8,7 @@
 #include <string.h>
 #include <float.h>  
 #include <assert.h> 
+#include <time.h>
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846f
@@ -66,6 +67,12 @@ typedef struct {
 } ActivationTensors;
 
 typedef struct {
+    double cpu_time;
+    double allocation_time;
+    int activations_memory;
+} Benchmark;
+
+typedef struct {
     GPT2Config config;
     // parameters
     ParameterTensors params;
@@ -106,6 +113,12 @@ void init_parameters_sizes(size_t *param_sizes, GPT2Config config) {
     param_sizes[13] = (size_t)L * C;          // fcprojb
     param_sizes[14] = (size_t)C;              // lnfw
     param_sizes[15] = (size_t)C;              // lnfb
+}
+
+void init_benchmark(Benchmark *benchmark) {
+    benchmark->allocation_time = 0.0f;
+    benchmark->cpu_time = 0.0f;
+    benchmark->activations_memory = 0;
 }
 
 // adds positional encoding and encoded token into an output
@@ -403,7 +416,8 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char *checkpoint_path) {
     model->mean_loss = -1.0f; // no loss
 }
 
-void gpt2_forward(GPT2 *model, int *inputs, int *targets, size_t B, size_t T) {
+void gpt2_forward(GPT2 *model, int *inputs, int *targets, size_t B, size_t T,
+                  Benchmark *benchmark) {
     if (model->params_memory == NULL) {
         printf("Error: uninitialized paramters\n");
         exit(1);
@@ -424,6 +438,8 @@ void gpt2_forward(GPT2 *model, int *inputs, int *targets, size_t B, size_t T) {
     }
 
     if (model->acts_memory == NULL) {
+        double alloc_time_start = clock();
+
         model->batch_size = B;
         model->seq_len = T;
 
@@ -448,18 +464,25 @@ void gpt2_forward(GPT2 *model, int *inputs, int *targets, size_t B, size_t T) {
         for (int i = 0; i < NUM_ACTIVATION_TENSORS; i++) {
             num_activations += model->act_sizes[i];
         }
-        printf("num_activations: %ld\n", num_activations);
+
         model->num_activations = num_activations;
+
+        benchmark->activations_memory = (num_activations * sizeof(float)) >> 20;
 
         model->acts_memory = malloc_and_point_activations(&model->acts, model->act_sizes);
         model->inputs = (int*)malloc(B * T * sizeof(int));
         model->targets = (int*)malloc(B * T * sizeof(int));
-    } else {
+
+        double alloc_time_end = clock();
+
+        benchmark->allocation_time = alloc_time_end - alloc_time_start;
+    } 
+    else {
         if (B != model->batch_size || T != model->seq_len) {
-        printf("Error: Dynamic resizing not supported. Model: B=%d T=%d, Desired: B=%ld T=%ld\n", 
-               model->batch_size, model->seq_len, B, T);
-        exit(1); // Abort to prevent buffer overflow
-    }
+            printf("Error: Dynamic resizing not supported. Model: B=%d T=%d, Desired: B=%ld T=%ld\n",
+                model->batch_size, model->seq_len, B, T);
+            exit(1); // Abort to prevent buffer overflow
+        }
     }
 
     // cache the inputs/targets
@@ -473,6 +496,9 @@ void gpt2_forward(GPT2 *model, int *inputs, int *targets, size_t B, size_t T) {
     float* residual;
 
     // --- Embedding Layer ---
+    
+    double total_time_start = clock();
+
     encoder_forward(acts.encoded, inputs, params.wte, params.wpe, B, T, C);
 
     for (int l = 0; l < L; l++) {
@@ -524,6 +550,9 @@ void gpt2_forward(GPT2 *model, int *inputs, int *targets, size_t B, size_t T) {
     layernorm_forward(acts.lnf, residual, params.lnfw, params.lnfb, B, T, C);
     matmul_forward(acts.logits, acts.lnf, params.wte, NULL, B, T, C, Vp);
 
+    double total_time_end = clock();
+
+    benchmark->cpu_time += total_time_end - total_time_start;
 }
 
 // numerically stable softmax in-place over n elements
@@ -551,8 +580,8 @@ int main() {
     gpt2_build_from_checkpoint(&model, "../gpt2_124M.bin");
 
     const char* tiny_shake_train = "../dev/data/tinyshakespeare/tiny_shakespeare_train.bin";
-    int B = 4;
-    int T = 64;
+    int B = 1;
+    int T = 8;
     Dataloader train_loader;
     dataloader_init(&train_loader, tiny_shake_train, B, T);
 
@@ -577,11 +606,15 @@ int main() {
 
     float *probs = (float*)malloc(V * sizeof(float)); // reused every step
 
-    int gen_steps = 100;
+    Benchmark benchmark;
+    init_benchmark(&benchmark);
+
+    double time_start = clock();
+    int gen_steps = 10;
     for (int step = 0; step < gen_steps; step++) {
 
         // forward pass — pass NULL targets (no loss needed during inference)
-        gpt2_forward(&model, gen_tokens, NULL, B, T);
+        gpt2_forward(&model, gen_tokens, NULL, B, T, &benchmark);
 
         // --- sample from batch item b=0, last position T-1 ---
         int b = 0;
@@ -610,6 +643,21 @@ int main() {
         }
         gen_tokens[b * T + (T - 1)] = next_token;
     }
+    double time_end = clock();
+    double time_taken = time_end - time_start;
+
+    printf("\n\n--- BENCHMARK ---\n");
+    printf("B = %d, T = %d, C = %d, Words Gen = %d\n", 
+        B, T, model.config.channels, gen_steps);
+    printf("Activations memory used: %d MB\n", benchmark.activations_memory);
+    printf("Total execution time: %.2lfms\n", time_taken / 1000);
+    printf("Allocation time overhead: %.2lfms\n", benchmark.allocation_time / 1000);
+    printf("Total CPU execution time: %.2lfms\n", benchmark.cpu_time / 1000);
+    printf("Average time per word generation: %.2lfms\n", 
+        time_taken / (gen_steps * 1000));
+    printf("Average time per GPU forward pass: %.2lfms\n", 
+        benchmark.cpu_time / (gen_steps * 1000));
+
     printf("\n");
 
     free(gen_tokens);

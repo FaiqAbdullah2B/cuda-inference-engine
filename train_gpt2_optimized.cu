@@ -5,6 +5,7 @@ extern "C" {
 }
 #include "./llmc/rand.h"
 #include "./dev/cuda/utils.h"
+#include <chrono>
 #include <math.h>
 #include <cuda_runtime.h>
 #include <mma.h>
@@ -94,6 +95,13 @@ typedef struct {
     float mean_loss;
 } GPT2;
 
+typedef struct {
+    double gpu_time;
+    double allocation_time;
+    int activations_memory;
+    int halfs_memory;
+} Benchmark;
+
 void init_parameters_sizes(size_t *param_sizes, GPT2Config config) {
     size_t Vp = config.padded_vocab_size;
     size_t C = config.channels;
@@ -138,6 +146,13 @@ void init_activation_sizes(size_t *act_sizes, int B, int T, GPT2Config config) {
     act_sizes[13] = B * T * C; // lnf
     act_sizes[14] = B * T * Vp; // logits
     act_sizes[15] = B * T * Vp; // probs
+}
+
+void init_benchmark(Benchmark *benchmark) {
+    benchmark->allocation_time = 0.0f;
+    benchmark->gpu_time = 0.0f;
+    benchmark->activations_memory = 0;
+    benchmark->halfs_memory = 0;
 }
 
 void init_half_sizes(size_t *half_sizes, int B, int T, GPT2Config config) {
@@ -445,7 +460,7 @@ __device__ float reduction_max(float val, float *input_s) {
 }
 
 // probs <- softmax(logits)
-#define TEMPERATURE 0.8f
+#define TEMPERATURE 0.75f
 __global__ void softmax_forward_kernel(float *probs, float *logits, 
                                        int B, int T, int V, int Vp) {
     int row_idx = blockIdx.x; // One block processes one row
@@ -612,21 +627,6 @@ void matmul_forward(float *out, half* qkvi, half* qkvw,
     cudaCheck(cudaGetLastError());
 
 }
-
-// void attention_forward(float *out, float *preatt_cache,
-//                        float *att_cache, float *inp, 
-//                        int B, int T, int C, int NH) {
-//     const int blockSize_x = 32;
-//     const int blockSize_y = 8;
-//     const int blockSize_z = 1;
-//     const int gridSize_x = CEIL_DIV(NH, blockSize_x);
-//     const int gridSize_y = CEIL_DIV(T, blockSize_y);
-//     const int gridSize_z = CEIL_DIV(B, blockSize_z);
-//     dim3 gridDim = dim3(gridSize_x, gridSize_y, gridSize_z);
-//     dim3 blockDim = dim3(blockSize_x, blockSize_y, blockSize_z);
-//     attention_forward_kernel<<<gridDim, blockDim>>>(
-//         out, preatt_cache, att_cache, inp, B, T, C, NH);
-// }
 
 #include <cuda_runtime.h>
 #include <math.h>
@@ -931,7 +931,7 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
 }
 
 void gpt2_forward(GPT2 *model, int *inputs, int *targets, int B, int T, 
-                  int additional) {
+                  int additional, Benchmark *benchmark) {
     if (model->params_memory == NULL) {
         printf("Error: model was not initialized properly.\n");
         exit(EXIT_FAILURE);
@@ -951,6 +951,8 @@ void gpt2_forward(GPT2 *model, int *inputs, int *targets, int B, int T,
     }
 
     if (model->acts_memory == NULL) {
+        auto alloc_time_start = std::chrono::high_resolution_clock::now();
+
         model->batch_size = B;
         model->seq_len = T;
         model->max_seq_len = T + additional;
@@ -965,12 +967,17 @@ void gpt2_forward(GPT2 *model, int *inputs, int *targets, int B, int T,
         model->num_activations = num_activations;
         model->acts_memory = malloc_and_point_activations(
             &model->acts, model->act_sizes);
-        printf("allocated %ld MiB for activations\n", 
-            (num_activations * sizeof(float)) >> 20);
+        
+        benchmark->activations_memory = (num_activations * sizeof(float)) >> 20;
         
         // also create memory for caching inputs and targets
         cudaCheck(cudaMalloc((void**)&model->inputs, B * model->max_seq_len * sizeof(int)));
         cudaCheck(cudaMalloc((void**)&model->targets, B * model->max_seq_len * sizeof(int)));
+
+        auto alloc_time_end = std::chrono::high_resolution_clock::now();
+        std::chrono::duration<double, std::milli> alloc_time = alloc_time_end - alloc_time_start;
+
+        benchmark->allocation_time = alloc_time.count();
     }
     else {
         if (B > model->batch_size || T > model->max_seq_len) {
@@ -990,8 +997,8 @@ void gpt2_forward(GPT2 *model, int *inputs, int *targets, int B, int T,
         model->num_halfs = num_halfs;
         model->halfs_memory = malloc_and_point_halfs(
             &model->halfs, model->half_sizes);
-        printf("allocated %ld MiB for halfs\n", 
-            (num_halfs * sizeof(half)) >> 20);
+        
+        benchmark->halfs_memory = (num_halfs * sizeof(half)) >> 20;
     }
     else {
         if (B > model->batch_size || T > model->max_seq_len) {
@@ -1017,6 +1024,13 @@ void gpt2_forward(GPT2 *model, int *inputs, int *targets, int B, int T,
     ActivationTensors acts = model->acts;
     HalfTensors halfs = model->halfs;
     float *residual;
+
+    cudaEvent_t start, stop; // timer variables
+    cudaCheck(cudaEventCreate(&start));
+    cudaCheck(cudaEventCreate(&stop));
+
+    cudaEventRecord(start);
+
     encoder_forward(acts.encoded, model->inputs, params.wte, params.wpe, B, T, C);
     for (int l = 0; l < L; l++) {
         residual = l == 0 ? acts.encoded : acts.residual3 + (l-1) * B * T * C;
@@ -1068,6 +1082,12 @@ void gpt2_forward(GPT2 *model, int *inputs, int *targets, int B, int T,
     layernorm_forward(acts.lnf, residual, params.lnfw, params.lnfb, B, T, C);
     matmul_forward(acts.logits, halfs.matrix_a, halfs.wte, acts.lnf, params.wte, NULL, B, T, C, Vp);
     softmax_forward(acts.probs, acts.logits, B, T, V, Vp);
+
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+    float iteration_time_taken = 0.0f;
+    cudaEventElapsedTime(&iteration_time_taken, start, stop);
+    benchmark->gpu_time += iteration_time_taken;
 }
 
 void generate_text(GPT2 *model, Tokenizer *tokenizer, int *prompt_tokens, int B, int T, int max_new_tokens) {
@@ -1086,8 +1106,13 @@ void generate_text(GPT2 *model, Tokenizer *tokenizer, int *prompt_tokens, int B,
     }
     printf("\n--- GENERATION ---\n");
 
+    Benchmark benchmark;
+    init_benchmark(&benchmark);
+
+    auto total_time_start = std::chrono::high_resolution_clock::now();
+
     for (int i = 0; i < max_new_tokens; i++) {
-        gpt2_forward(model, sequence, NULL, 1, current_len, max_new_tokens - i);
+        gpt2_forward(model, sequence, NULL, 1, current_len, max_new_tokens - i, &benchmark);
 
         // get the softmax probabilities for the generated sequence
         float *d_last_probs = model->acts.probs + (current_len - 1) * model->config.padded_vocab_size;
@@ -1117,7 +1142,23 @@ void generate_text(GPT2 *model, Tokenizer *tokenizer, int *prompt_tokens, int B,
         printf("%s", tokenizer_decode(tokenizer, next_token));
         fflush(stdout);
     }
-    
+
+    auto total_time_end = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double, std::milli> elapsed = total_time_end - total_time_start;
+
+    printf("\n\n--- BENCHMARK ---\n");
+    printf("B = %d, T = %d to %d, C = %d, Words Gen = %d\n", 
+        B, T, total_capacity, model->config.channels, max_new_tokens);
+    printf("Activations memory used: %d MB\n", benchmark.activations_memory);
+    printf("Halfs memory used: %d MB\n", benchmark.halfs_memory);
+    printf("Total execution time: %lf ms\n", elapsed.count());
+    printf("Allocation time overhead: %lf ms\n", benchmark.allocation_time);
+    printf("Total GPU execution time: %lf ms\n", benchmark.gpu_time);
+    printf("Average time per word generation: %lf ms\n", 
+        elapsed.count() / max_new_tokens);
+    printf("Average time per GPU forward pass: %lf ms\n", 
+        benchmark.gpu_time / max_new_tokens);
+
     printf("\n");
     free(h_probs);
     free(sequence);

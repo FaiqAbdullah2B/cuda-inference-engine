@@ -5,6 +5,7 @@ extern "C" {
 }
 #include "./llmc/rand.h"
 #include "./dev/cuda/utils.h"
+#include <chrono>
 #include <math.h>
 
 typedef struct {
@@ -78,6 +79,12 @@ typedef struct {
     float mean_loss;
 } GPT2;
 
+typedef struct {
+    double gpu_time;
+    double allocation_time;
+    int activations_memory;
+} Benchmark;
+
 void init_parameters_sizes(size_t *param_sizes, GPT2Config config) {
     size_t Vp = config.padded_vocab_size;
     size_t C = config.channels;
@@ -122,6 +129,12 @@ void init_activation_sizes(size_t *act_sizes, int B, int T, GPT2Config config) {
     act_sizes[13] = B * T * C; // lnf
     act_sizes[14] = B * T * Vp; // logits
     act_sizes[15] = B * T * Vp; // probs
+}
+
+void init_benchmark(Benchmark *benchmark) {
+    benchmark->allocation_time = 0.0f;
+    benchmark->gpu_time = 0.0f;
+    benchmark->activations_memory = 0;
 }
 
 // kernels
@@ -515,7 +528,8 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
     model->mean_loss = -1.0f; // -1.0f will designate no loss
 }
 
-void gpt2_forward(GPT2 *model, int *inputs, int *targets, int B, int T, int additional) {
+void gpt2_forward(GPT2 *model, int *inputs, int *targets, int B, int T, int additional, 
+                  Benchmark *benchmark) {
     if (model->params_memory == NULL) {
         printf("Error: model was not initialized properly.\n");
         exit(EXIT_FAILURE);
@@ -535,6 +549,8 @@ void gpt2_forward(GPT2 *model, int *inputs, int *targets, int B, int T, int addi
     }
 
     if (model->acts_memory == NULL) {
+        auto alloc_time_start = std::chrono::high_resolution_clock::now();
+
         model->batch_size = B;
         model->seq_len = T;
         model->max_seq_len = T + additional;
@@ -549,12 +565,17 @@ void gpt2_forward(GPT2 *model, int *inputs, int *targets, int B, int T, int addi
         model->num_activations = num_activations;
         model->acts_memory = malloc_and_point_activations(
             &model->acts, model->act_sizes);
-        printf("allocated %ld MiB for activations\n\n", 
-            (num_activations * sizeof(float)) >> 20);
-        
+
+        benchmark->activations_memory = (num_activations * sizeof(float)) >> 20;
+
         // also create memory for caching inputs and targets
         cudaCheck(cudaMalloc((void**)&model->inputs, B * model->max_seq_len * sizeof(int)));
         cudaCheck(cudaMalloc((void**)&model->targets, B * model->max_seq_len * sizeof(int)));
+
+        auto alloc_time_end = std::chrono::high_resolution_clock::now();
+        std::chrono::duration<double, std::milli> alloc_time = alloc_time_end - alloc_time_start;
+
+        benchmark->allocation_time = alloc_time.count();
     }
     else {
         if (B > model->batch_size || T > model->max_seq_len) {
@@ -579,6 +600,12 @@ void gpt2_forward(GPT2 *model, int *inputs, int *targets, int B, int T, int addi
     ParameterTensors params = model->params;
     ActivationTensors acts = model->acts;
     float *residual;
+
+    cudaEvent_t start, stop; // timer variables
+    cudaCheck(cudaEventCreate(&start));
+    cudaCheck(cudaEventCreate(&stop));
+
+    cudaEventRecord(start);
 
     encoder_forward(acts.encoded, model->inputs, params.wte, params.wpe, B, T, C);
     for (int l = 0; l < L; l++) {
@@ -627,6 +654,12 @@ void gpt2_forward(GPT2 *model, int *inputs, int *targets, int B, int T, int addi
     layernorm_forward(acts.lnf, residual, params.lnfw, params.lnfb, B, T, C);
     matmul_forward(acts.logits, acts.lnf, params.wte, NULL, B, T, C, Vp);
     softmax_forward(acts.probs, acts.logits, B, T, V, Vp);
+
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+    float iteration_time_taken = 0.0f;
+    cudaEventElapsedTime(&iteration_time_taken, start, stop);
+    benchmark->gpu_time += iteration_time_taken;
 }
 
 void generate_text(GPT2 *model, Tokenizer *tokenizer, int *prompt_tokens, int B, int T, int max_new_tokens) {
@@ -645,9 +678,15 @@ void generate_text(GPT2 *model, Tokenizer *tokenizer, int *prompt_tokens, int B,
     }
     printf("\n--- GENERATION ---\n");
 
-    for (int i = 0; i < max_new_tokens; i++) {
-        gpt2_forward(model, sequence, NULL, 1, current_len, max_new_tokens - i);
+    Benchmark benchmark;
+    init_benchmark(&benchmark);
 
+    auto total_time_start = std::chrono::high_resolution_clock::now();
+
+    for (int i = 0; i < max_new_tokens; i++) {
+        gpt2_forward(model, sequence, NULL, 1, current_len, max_new_tokens - i, &benchmark);
+
+        cudaDeviceSynchronize();
         // get the softmax probabilities for the generated sequence
         float *d_last_probs = model->acts.probs + (current_len - 1) * model->config.padded_vocab_size;
 
@@ -676,7 +715,22 @@ void generate_text(GPT2 *model, Tokenizer *tokenizer, int *prompt_tokens, int B,
         printf("%s", tokenizer_decode(tokenizer, next_token));
         fflush(stdout);
     }
-    
+
+    auto total_time_end = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double, std::milli> elapsed = total_time_end - total_time_start;
+
+    printf("\n\n--- BENCHMARK ---\n");
+    printf("B = %d, T = %d to %d, C = %d, Words Gen = %d\n", 
+        B, T, total_capacity, model->config.channels, max_new_tokens);
+    printf("Activations memory used: %d MB\n", benchmark.activations_memory);
+    printf("Total execution time: %lf ms\n", elapsed.count());
+    printf("Allocation time overhead: %lf ms\n", benchmark.allocation_time);
+    printf("Total GPU execution time: %lf ms\n", benchmark.gpu_time);
+    printf("Average time per word generation: %lf ms\n", 
+        elapsed.count() / max_new_tokens);
+    printf("Average time per GPU forward pass: %lf ms\n", 
+        benchmark.gpu_time / max_new_tokens);
+
     printf("\n");
     free(h_probs);
     free(sequence);
@@ -724,11 +778,12 @@ int main(int argc, char *argv[]) {
     srand(time(NULL));
 
     dataloader_next_batch(&train_loader);
-    dataloader_next_batch(&train_loader);
-    dataloader_next_batch(&train_loader);
-    dataloader_next_batch(&train_loader);
+    
+    for (int i = 0; i < batch_skips; i++) {
+        dataloader_next_batch(&train_loader);
+    }
 
-    generate_text(&model, &tokenizer, train_loader.inputs, B, T, 256);
+    generate_text(&model, &tokenizer, train_loader.inputs, B, T, max_sequence_len);
 
     dataloader_free(&train_loader);
     tokenizer_free(&tokenizer);
