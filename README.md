@@ -106,7 +106,7 @@ manually tracking tensor shapes through every layer until the architecture actua
 | Activations memory | 6 MB | 98 MB | 98 MB |
 | Half-precision memory | — | — | 78 MB |
 
-**Optimized GPU is ~22× faster than Naive GPU, and ~164× faster than CPU** *(note: CPU run used C = 768 vs C = 88 for GPU runs)*
+**Optimized GPU is ~22× faster than Naive GPU, and ~164× faster than CPU**
 
 <details>
 <summary>Raw benchmark output</summary>
