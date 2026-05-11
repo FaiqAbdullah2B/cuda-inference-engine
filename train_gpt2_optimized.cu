@@ -140,7 +140,6 @@ void init_activation_sizes(size_t *act_sizes, int B, int T, GPT2Config config) {
 }
 
 void init_half_sizes(size_t *half_sizes, int B, int T, GPT2Config config) {
-    size_t L = config.num_layers;
     size_t C = config.channels;
     size_t Vp = config.padded_vocab_size;
 
@@ -1054,6 +1053,7 @@ int main(int argc, char *argv[]) {
     int batch_skips = 0;
     int max_sequence_len = 100;
 
+    // optional command line args: B, T, batch_skips, max_sequence_len
     if (argc >= 2) {
         B = atoi(argv[1]);
     }
@@ -1066,7 +1066,7 @@ int main(int argc, char *argv[]) {
     if (argc >= 5) {
         max_sequence_len = atoi(argv[4]);
     }
-    
+
     assert(B > 0 && T > 0 && batch_skips >= 0 && max_sequence_len > 0);
 
     Dataloader train_loader;
