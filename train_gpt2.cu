@@ -370,9 +370,9 @@ void attention_forward(float *out, float *preatt_cache,
     const int blockSize_x = 32;
     const int blockSize_y = 8;
     const int blockSize_z = 1;
-    const int gridSize_x = CEIL_DIV(B, blockSize_z);
+    const int gridSize_x = CEIL_DIV(NH, blockSize_x);
     const int gridSize_y = CEIL_DIV(T, blockSize_y);
-    const int gridSize_z = CEIL_DIV(NH, blockSize_x);
+    const int gridSize_z = CEIL_DIV(B, blockSize_z);
     dim3 gridDim = dim3(gridSize_x, gridSize_y, gridSize_z);
     dim3 blockDim = dim3(blockSize_x, blockSize_y, blockSize_z);
     attention_forward_kernel<<<gridDim, blockDim>>>(
