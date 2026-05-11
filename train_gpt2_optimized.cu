@@ -841,6 +841,7 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
     fclose(model_file);
 
     // other inits
+    model->halfs_memory = NULL;
     model->acts_memory = NULL;
     model->inputs = NULL;
     model->targets = NULL;
