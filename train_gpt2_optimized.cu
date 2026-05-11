@@ -503,7 +503,7 @@ __device__ float reduction_max(float val, float *input_s) {
 }
 
 // probs <- softmax(logits)
-#define TEMPERATURE 0.75f
+#define TEMPERATURE 0.8f
 __global__ void softmax_forward_kernel(float *probs, float *logits, 
                                        int B, int T, int V, int Vp) {
     int row_idx = blockIdx.x; // One block processes one row
@@ -1015,7 +1015,7 @@ void generate_text(GPT2 *model, Tokenizer *tokenizer, int *prompt_tokens, int B,
         float coin_flip = (float)rand() / (float)RAND_MAX;
         float cdf = 0.0f;
         int next_token = model->config.vocab_size - 1; // Safe fallback
-        
+
         for (int v = 0; v < model->config.vocab_size; v++) {
             cdf += h_probs[v];
             if (coin_flip < cdf) {
@@ -1029,6 +1029,7 @@ void generate_text(GPT2 *model, Tokenizer *tokenizer, int *prompt_tokens, int B,
         current_len++;
 
         printf("%s", tokenizer_decode(tokenizer, next_token));
+        fflush(stdout);
     }
     
     printf("\n");

@@ -674,6 +674,7 @@ void generate_text(GPT2 *model, Tokenizer *tokenizer, int *prompt_tokens, int B,
         current_len++;
 
         printf("%s", tokenizer_decode(tokenizer, next_token));
+        fflush(stdout);
     }
     
     printf("\n");
