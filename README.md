@@ -83,14 +83,12 @@ manually tracking tensor shapes through every layer until the architecture actua
 ---
 
 ### GPU — Optimized CUDA
-
 | Component | Status |
 |---|---|
-| Tiled matmul (shared memory) | Planned |
-| Fused LayerNorm | Planned |
-| Attention with reduced global mem reads | Planned |
-| Full pass + benchmarks vs naive | Planned |
-
+| WMMA matmul (Tensor Core calls) |  Done |
+| Attention (running softmax, shared mem + reduction) |  Done |
+| Texture cache for cached reads (LayerNorm & Attention) |  Done |
+| Full pass + benchmarks vs naive |  Done |
 ---
 
 ## Running the Code
