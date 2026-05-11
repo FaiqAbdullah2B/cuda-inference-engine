@@ -688,13 +688,32 @@ void gpt2_free(GPT2 *model) {
     cudaCheck(cudaFree(model->targets));
 }
 
-int main() {
+int main(int argc, char *argv[]) {
     GPT2 model;
     gpt2_build_from_checkpoint(&model, "../gpt2_124M.bin");
 
     const char* tiny_shake_train = "../dev/data/tinyshakespeare/tiny_shakespeare_train.bin";
     int B = 1;
     int T = 256;
+    int batch_skips = 0;
+    int max_sequence_len = 100;
+
+    // optional command line args: B, T, batch_skips, max_sequence_len
+    if (argc >= 2) {
+        B = atoi(argv[1]);
+    }
+    if (argc >= 3) {
+        T = atoi(argv[2]);
+    }
+    if (argc >= 4) {
+        batch_skips = atoi(argv[3]);
+    }
+    if (argc >= 5) {
+        max_sequence_len = atoi(argv[4]);
+    }
+    
+    assert(B > 0 && T > 0 && batch_skips >= 0 && max_sequence_len > 0);
+
     Dataloader train_loader;
     dataloader_init(&train_loader, tiny_shake_train, B, T);
 
