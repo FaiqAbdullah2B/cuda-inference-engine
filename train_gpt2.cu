@@ -37,7 +37,7 @@ typedef struct {
     float *lnfb;        // final normalization's biases
 } ParameterTensors;
 
-#define NUM_ACTIVATION_TENSORS 17
+#define NUM_ACTIVATION_TENSORS 16
 typedef struct {
     float *encoded; // output of encoding
     float *ln1;     // output of first layer normalization
@@ -72,6 +72,7 @@ typedef struct {
 
     int batch_size; // B
     int seq_len; // T
+    int max_seq_len; // for position encoding offset
     int *inputs;
     int *targets;
     float mean_loss;
@@ -249,6 +250,11 @@ __global__ void attention_forward_kernel(float *out, float *preatt_cache,
         }
 
         int out_offset = b * T * C + t * C + h * hs;
+
+        for (int i = 0; i < hs; i++) {
+            out[out_offset + i] = 0.0f; // initialize output to 0 for accumulation
+        }
+
         for (int t2 = 0; t2 <= t; t2++) {
             float weight = att_cache[row_offset + t2] / exp_sum; // The actual Softmax score
             float *valt = inp + b * T * C3 + t2 * C3 + h * hs + 2 * C; // Offset for V
@@ -505,10 +511,11 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
     model->targets = NULL;
     model->batch_size = 0;
     model->seq_len = 0;
+    model->max_seq_len = 0;
     model->mean_loss = -1.0f; // -1.0f will designate no loss
 }
 
-void gpt2_forward(GPT2 *model, int *inputs, int *targets, int B, int T) {
+void gpt2_forward(GPT2 *model, int *inputs, int *targets, int B, int T, int additional) {
     if (model->params_memory == NULL) {
         printf("Error: model was not initialized properly.\n");
         exit(EXIT_FAILURE);
@@ -527,20 +534,12 @@ void gpt2_forward(GPT2 *model, int *inputs, int *targets, int B, int T) {
         }
     }
 
-    if (model->acts_memory != NULL) {
-        if (B != model->batch_size || T != model->seq_len) {
-            cudaFree(model->acts_memory);
-            cudaFree(model->inputs);
-            cudaFree(model->targets);
-            model->acts_memory = NULL;
-        }
-    }
-
     if (model->acts_memory == NULL) {
         model->batch_size = B;
         model->seq_len = T;
+        model->max_seq_len = T + additional;
 
-        init_activation_sizes(model->act_sizes, B, T, model->config);
+        init_activation_sizes(model->act_sizes, B, model->max_seq_len, model->config);
 
         size_t num_activations = 0;
         for (size_t i = 0; i < NUM_ACTIVATION_TENSORS; i++) {
@@ -550,17 +549,16 @@ void gpt2_forward(GPT2 *model, int *inputs, int *targets, int B, int T) {
         model->num_activations = num_activations;
         model->acts_memory = malloc_and_point_activations(
             &model->acts, model->act_sizes);
-        // printf("allocated %ld MiB for activations\n", 
-        //     (num_activations * sizeof(float)) >> 20);
+        printf("allocated %ld MiB for activations\n\n", 
+            (num_activations * sizeof(float)) >> 20);
         
         // also create memory for caching inputs and targets
-        cudaCheck(cudaMalloc((void**)&model->inputs, B * T * sizeof(int)));
-        cudaCheck(cudaMalloc((void**)&model->targets, B * T * sizeof(int)));
-        // cudaCheck(cudaMallocHost((void**)&model->cpu_losses, B * T * sizeof(float)));
+        cudaCheck(cudaMalloc((void**)&model->inputs, B * model->max_seq_len * sizeof(int)));
+        cudaCheck(cudaMalloc((void**)&model->targets, B * model->max_seq_len * sizeof(int)));
     }
     else {
-        if (B != model->batch_size || T != model->seq_len) {
-            printf("Model: B=%d T=%d, Desired: B=%d T=%d\n", model->batch_size, model->seq_len, B, T);
+        if (B > model->batch_size || T > model->max_seq_len) {
+            printf("Model: B=%d T=%d, Desired: B=%d T=%d\n", model->batch_size, model->max_seq_len, B, T);
             exit(EXIT_FAILURE);
         }
     }
@@ -581,6 +579,7 @@ void gpt2_forward(GPT2 *model, int *inputs, int *targets, int B, int T) {
     ParameterTensors params = model->params;
     ActivationTensors acts = model->acts;
     float *residual;
+
     encoder_forward(acts.encoded, model->inputs, params.wte, params.wpe, B, T, C);
     for (int l = 0; l < L; l++) {
         residual = l == 0 ? acts.encoded : acts.residual3 + (l-1) * B * T * C;
@@ -640,8 +639,14 @@ void generate_text(GPT2 *model, Tokenizer *tokenizer, int *prompt_tokens, int B,
 
     float *h_probs = (float*)malloc(model->config.vocab_size * sizeof(float));
 
+    printf("--- PROMPT ---\n");
+    for (int i = 0; i < B * T; i++) {
+        printf("%s", tokenizer_decode(tokenizer, prompt_tokens[i])); 
+    }
+    printf("\n--- GENERATION ---\n");
+
     for (int i = 0; i < max_new_tokens; i++) {
-        gpt2_forward(model, sequence, NULL, 1, current_len);
+        gpt2_forward(model, sequence, NULL, 1, current_len, max_new_tokens - i);
 
         // get the softmax probabilities for the generated sequence
         float *d_last_probs = model->acts.probs + (current_len - 1) * model->config.padded_vocab_size;
@@ -687,40 +692,25 @@ int main() {
     GPT2 model;
     gpt2_build_from_checkpoint(&model, "../gpt2_124M.bin");
 
+    const char* tiny_shake_train = "../dev/data/tinyshakespeare/tiny_shakespeare_train.bin";
+    int B = 1;
+    int T = 256;
+    Dataloader train_loader;
+    dataloader_init(&train_loader, tiny_shake_train, B, T);
+
     Tokenizer tokenizer;
     tokenizer_init(&tokenizer, "../gpt2_tokenizer.bin");
 
-    int B = 1;          
-    int T = 128;
-    
-    const char* tiny_shake_train = "../dev/data/tinyshakespeare/tiny_shakespeare_train.bin";
-    Dataloader train_loader;
-    dataloader_init(&train_loader, tiny_shake_train, B, T);
-    
-    // Fetch a batch to use as prompt
-    dataloader_next_batch(&train_loader);
-    dataloader_next_batch(&train_loader);
-    dataloader_next_batch(&train_loader);
-    dataloader_next_batch(&train_loader);
-
-    printf("--- PROMPT ---\n");
-    for (int i = 0; i < B * T; i++) {
-        printf("%s", tokenizer_decode(&tokenizer, train_loader.inputs[i])); 
-    }
-    printf("\n--- GENERATION ---\n");
-
-    // Seed the random number generator
     srand(time(NULL));
 
-    int max_new_tokens = 100;
+    dataloader_next_batch(&train_loader);
+    dataloader_next_batch(&train_loader);
+    dataloader_next_batch(&train_loader);
+    dataloader_next_batch(&train_loader);
 
-    generate_text(&model, &tokenizer, train_loader.inputs, B, T, max_new_tokens);
-
-    printf("\n------------------\n");
+    generate_text(&model, &tokenizer, train_loader.inputs, B, T, 256);
 
     dataloader_free(&train_loader);
     tokenizer_free(&tokenizer);
     gpt2_free(&model);
-    
-    return 0;
 }
