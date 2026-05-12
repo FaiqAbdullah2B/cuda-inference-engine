@@ -575,25 +575,46 @@ int sample_multinomial(float *probs, int n, float coin) {
     return n - 1; // fallback for floating point rounding
 }
 
-int main() {
+int main(int argc, char *argv[]) {
     GPT2 model;
     gpt2_build_from_checkpoint(&model, "../gpt2_124M.bin");
 
     const char* tiny_shake_train = "../dev/data/tinyshakespeare/tiny_shakespeare_train.bin";
+
     int B = 1;
     int T = 8;
+    int batch_skips = 0;
+    int max_sequence_len = 10;
+
+    // optional command line args: B, T, batch_skips, max_sequence_len
+    if (argc >= 2) {
+        B = atoi(argv[1]);
+    }
+    if (argc >= 3) {
+        T = atoi(argv[2]);
+    }
+    if (argc >= 4) {
+        batch_skips = atoi(argv[3]);
+    }
+    if (argc >= 5) {
+        max_sequence_len = atoi(argv[4]);
+    }
+    
+    assert(B > 0 && T > 0 && batch_skips >= 0 && max_sequence_len > 0);
+
     Dataloader train_loader;
     dataloader_init(&train_loader, tiny_shake_train, B, T);
 
     Tokenizer tokenizer;
     tokenizer_init(&tokenizer, "../gpt2_tokenizer.bin");
 
+    srand(time(NULL));
+
     dataloader_next_batch(&train_loader);
     
-    // gpt2_forward(&model, train_loader.inputs, train_loader.targets, B, T);
-    
-    // --- Generation loop ---
-    printf("\n--- Generating ---\n");
+    for (int i = 0; i < batch_skips; i++) {
+        dataloader_next_batch(&train_loader);
+    }
 
     int V  = model.config.vocab_size;
     int Vp = model.config.padded_vocab_size;
@@ -602,16 +623,21 @@ int main() {
     int *gen_tokens = (int*)malloc(B * T * sizeof(int));
     memcpy(gen_tokens, train_loader.inputs, B * T * sizeof(int));
 
-    srand(43);
-
     float *probs = (float*)malloc(V * sizeof(float)); // reused every step
 
     Benchmark benchmark;
     init_benchmark(&benchmark);
 
+    printf("--- PROMPT ---\n");
+    for (int i = 0; i < B * T; i++) {
+        printf("%s", tokenizer_decode(&tokenizer, train_loader.inputs[i])); 
+    }
+
+    // --- Generation loop ---
+    printf("\n--- Generating ---\n");
+
     double time_start = clock();
-    int gen_steps = 10;
-    for (int step = 0; step < gen_steps; step++) {
+    for (int step = 0; step < max_sequence_len; step++) {
 
         // forward pass — pass NULL targets (no loss needed during inference)
         gpt2_forward(&model, gen_tokens, NULL, B, T, &benchmark);
@@ -648,15 +674,15 @@ int main() {
 
     printf("\n\n--- BENCHMARK ---\n");
     printf("B = %d, T = %d, C = %d, Words Gen = %d\n", 
-        B, T, model.config.channels, gen_steps);
+        B, T, model.config.channels, max_sequence_len);
     printf("Activations memory used: %d MB\n", benchmark.activations_memory);
     printf("Total execution time: %.2lfms\n", time_taken / 1000);
     printf("Allocation time overhead: %.2lfms\n", benchmark.allocation_time / 1000);
     printf("Total CPU execution time: %.2lfms\n", benchmark.cpu_time / 1000);
     printf("Average time per word generation: %.2lfms\n", 
-        time_taken / (gen_steps * 1000));
+        time_taken / (max_sequence_len * 1000));
     printf("Average time per GPU forward pass: %.2lfms\n", 
-        benchmark.cpu_time / (gen_steps * 1000));
+        benchmark.cpu_time / (max_sequence_len * 1000));
 
     printf("\n");
 
