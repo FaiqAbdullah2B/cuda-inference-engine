@@ -416,10 +416,9 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char *checkpoint_path) {
     model->mean_loss = -1.0f; // no loss
 }
 
-void gpt2_forward(GPT2 *model, int *inputs, int *targets, size_t B, size_t T,
-                  Benchmark *benchmark) {
+void gpt2_forward(GPT2 *model, int *inputs, int *targets, size_t B, size_t T, size_t maxT, Benchmark *benchmark) {
     if (model->params_memory == NULL) {
-        printf("Error: uninitialized paramters\n");
+        printf("Error: uninitialized parameters\n");
         exit(1);
     }
 
@@ -429,36 +428,32 @@ void gpt2_forward(GPT2 *model, int *inputs, int *targets, size_t B, size_t T,
     size_t NH = model->config.num_heads;
     size_t C = model->config.channels;
 
-    // validate inputs, all indices must be in the range [0, V)
     for(int i = 0; i < B * T; i++) {
         assert(0 <= inputs[i] && inputs[i] < V);
-        if (targets != NULL) {
-            assert(0 <= targets[i] && targets[i] < V);
-        }
     }
 
     if (model->acts_memory == NULL) {
         double alloc_time_start = clock();
 
         model->batch_size = B;
-        model->seq_len = T;
+        model->seq_len = maxT; // Store max capacity, not current T
 
-        // allocate space for activations
-        model->act_sizes[0] = B * T * C;               // encoded
-        model->act_sizes[1] = L * B * T * C;           // ln1
-        model->act_sizes[2] = L * B * T * 3 * C;       // qkv
-        model->act_sizes[3] = L * B * T * C;           // atty
-        model->act_sizes[4] = L * B * NH * T * T;      // preatt
-        model->act_sizes[5] = L * B * NH * T * T;      // att
-        model->act_sizes[6] = L * B * T * C;           // attproj
-        model->act_sizes[7] = L * B * T * C;           // residual2
-        model->act_sizes[8] = L * B * T * C;           // ln2
-        model->act_sizes[9] = L * B * T * 4 * C;       // fch
-        model->act_sizes[10] = L * B * T * 4 * C;      // fch_gelu
-        model->act_sizes[11] = L * B * T * C;          // fcproj
-        model->act_sizes[12] = L * B * T * C;          // residual3
-        model->act_sizes[13] = B * T * C;              // lnf
-        model->act_sizes[14] = B * T * Vp;             // logits
+        // Allocate space for activations using maxT
+        model->act_sizes[0] = B * maxT * C;              
+        model->act_sizes[1] = L * B * maxT * C;          
+        model->act_sizes[2] = L * B * maxT * 3 * C;      
+        model->act_sizes[3] = L * B * maxT * C;          
+        model->act_sizes[4] = L * B * NH * maxT * maxT;  
+        model->act_sizes[5] = L * B * NH * maxT * maxT;  
+        model->act_sizes[6] = L * B * maxT * C;          
+        model->act_sizes[7] = L * B * maxT * C;          
+        model->act_sizes[8] = L * B * maxT * C;          
+        model->act_sizes[9] = L * B * maxT * 4 * C;      
+        model->act_sizes[10] = L * B * maxT * 4 * C;     
+        model->act_sizes[11] = L * B * maxT * C;         
+        model->act_sizes[12] = L * B * maxT * C;         
+        model->act_sizes[13] = B * maxT * C;             
+        model->act_sizes[14] = B * maxT * Vp;            
 
         size_t num_activations = 0;
         for (int i = 0; i < NUM_ACTIVATION_TENSORS; i++) {
@@ -466,26 +461,25 @@ void gpt2_forward(GPT2 *model, int *inputs, int *targets, size_t B, size_t T,
         }
 
         model->num_activations = num_activations;
-
         benchmark->activations_memory = (num_activations * sizeof(float)) >> 20;
 
         model->acts_memory = malloc_and_point_activations(&model->acts, model->act_sizes);
-        model->inputs = (int*)malloc(B * T * sizeof(int));
-        model->targets = (int*)malloc(B * T * sizeof(int));
+        model->inputs = (int*)malloc(B * maxT * sizeof(int));
+        model->targets = (int*)malloc(B * maxT * sizeof(int));
 
         double alloc_time_end = clock();
-
         benchmark->allocation_time = alloc_time_end - alloc_time_start;
     } 
     else {
-        if (B != model->batch_size || T != model->seq_len) {
-            printf("Error: Dynamic resizing not supported. Model: B=%d T=%d, Desired: B=%ld T=%ld\n",
+        // Just ensure we don't overflow the stadium
+        if (B != model->batch_size || T > model->seq_len) {
+            printf("Error: Buffer overflow. Model max capacity: B=%d T=%d, Requested: B=%ld T=%ld\n",
                 model->batch_size, model->seq_len, B, T);
-            exit(1); // Abort to prevent buffer overflow
+            exit(1);
         }
     }
 
-    // cache the inputs/targets
+    // Cache ONLY the active T inputs/targets
     memcpy(model->inputs, inputs, B * T * sizeof(int));
     if (targets != NULL) {
         memcpy(model->targets, targets, B * T * sizeof(int));
@@ -495,17 +489,16 @@ void gpt2_forward(GPT2 *model, int *inputs, int *targets, size_t B, size_t T,
     ActivationTensors acts = model->acts;
     float* residual;
 
-    // --- Embedding Layer ---
-    
     double total_time_start = clock();
 
+    // Do mathematical forward pass on T, but stride memory by maxT
     encoder_forward(acts.encoded, inputs, params.wte, params.wpe, B, T, C);
 
     for (int l = 0; l < L; l++) {
 
-        residual = l == 0 ? acts.encoded : acts.residual3 + (l-1) * B * T * C;
+        // Memory stride uses maxT!
+        residual = l == 0 ? acts.encoded : acts.residual3 + (l-1) * B * maxT * C;
 
-        // get the pointers of the weights for this layer
         float* l_ln1w = params.ln1w + l * C;
         float* l_ln1b = params.ln1b + l * C;
         float* l_qkvw = params.qkvw + l * 3*C * C;
@@ -519,21 +512,21 @@ void gpt2_forward(GPT2 *model, int *inputs, int *targets, size_t B, size_t T,
         float* l_fcprojw = params.fcprojw + l * C * 4*C;
         float* l_fcprojb = params.fcprojb + l * C;
 
-        // get the pointers of the activations for this layer
-        float* l_ln1 = acts.ln1 + l * B * T * C;
-        float* l_qkv = acts.qkv + l * B * T * 3*C;
-        float* l_atty = acts.atty + l * B * T * C;
-        float* l_preatt = acts.preatt + l * B * NH * T * T;
-        float* l_att = acts.att + l * B * NH * T * T;
-        float* l_attproj = acts.attproj + l * B * T * C;
-        float* l_residual2 = acts.residual2 + l * B * T * C;
-        float* l_ln2 = acts.ln2 + l * B * T * C;
-        float* l_fch = acts.fch + l * B * T * 4*C;
-        float* l_fch_gelu = acts.fch_gelu + l * B * T * 4*C;
-        float* l_fcproj = acts.fcproj + l * B * T * C;
-        float* l_residual3 = acts.residual3 + l * B * T * C;
+        // Pointers to the active window within the maxT arena
+        float* l_ln1 = acts.ln1 + l * B * maxT * C;
+        float* l_qkv = acts.qkv + l * B * maxT * 3*C;
+        float* l_atty = acts.atty + l * B * maxT * C;
+        float* l_preatt = acts.preatt + l * B * NH * maxT * maxT;
+        float* l_att = acts.att + l * B * NH * maxT * maxT;
+        float* l_attproj = acts.attproj + l * B * maxT * C;
+        float* l_residual2 = acts.residual2 + l * B * maxT * C;
+        float* l_ln2 = acts.ln2 + l * B * maxT * C;
+        float* l_fch = acts.fch + l * B * maxT * 4*C;
+        float* l_fch_gelu = acts.fch_gelu + l * B * maxT * 4*C;
+        float* l_fcproj = acts.fcproj + l * B * maxT * C;
+        float* l_residual3 = acts.residual3 + l * B * maxT * C;
 
-        // now do the forward pass
+        // Math is executed ONLY on T elements
         layernorm_forward(l_ln1, residual, l_ln1w, l_ln1b, B, T, C);
         matmul_forward(l_qkv, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C);
         attention_forward(l_atty, l_preatt, l_att, l_qkv, B, T, C, NH);
@@ -546,12 +539,11 @@ void gpt2_forward(GPT2 *model, int *inputs, int *targets, size_t B, size_t T,
         residual_forward(l_residual3, l_residual2, l_fcproj, B*T*C);
     }
 
-    residual = acts.residual3 + (L-1) * B * T * C; // last residual is in residual3
+    residual = acts.residual3 + (L-1) * B * maxT * C; 
     layernorm_forward(acts.lnf, residual, params.lnfw, params.lnfb, B, T, C);
     matmul_forward(acts.logits, acts.lnf, params.wte, NULL, B, T, C, Vp);
 
     double total_time_end = clock();
-
     benchmark->cpu_time += total_time_end - total_time_start;
 }
 
@@ -575,6 +567,74 @@ int sample_multinomial(float *probs, int n, float coin) {
     return n - 1; // fallback for floating point rounding
 }
 
+void generate_text(GPT2 *model, Tokenizer *tokenizer, int *prompt_tokens, int B, int T, int max_new_tokens) {
+    int current_len = T;
+    int maxT = T + max_new_tokens; // The maximum capacity of our arena
+
+    // Allocate a buffer large enough for the prompt + all generated tokens
+    int *sequence = (int*)malloc(B * maxT * sizeof(int));
+    memcpy(sequence, prompt_tokens, B * T * sizeof(int));
+
+    int V = model->config.vocab_size;
+    int Vp = model->config.padded_vocab_size;
+    float *probs = (float*)malloc(V * sizeof(float));
+
+    printf("--- PROMPT ---\n");
+    for (int i = 0; i < B * T; i++) {
+        if (tokenizer->init_ok) printf("%s", tokenizer_decode(tokenizer, prompt_tokens[i])); 
+        else printf("%d ", prompt_tokens[i]);
+    }
+    printf("\n--- GENERATING ---\n");
+    fflush(stdout);
+
+    Benchmark benchmark;
+    init_benchmark(&benchmark);
+
+    double time_start = clock();
+
+    for (int step = 0; step < max_new_tokens; step++) {
+        // Forward pass: pass current_len for math, maxT for memory boundaries
+        gpt2_forward(model, sequence, NULL, B, current_len, maxT, &benchmark);
+
+        // Sample from the last position of the current active length
+        int b = 0;
+        float *logits_last = model->acts.logits + b * current_len * Vp + (current_len - 1) * Vp;
+
+        for (int i = 0; i < V; i++) probs[i] = logits_last[i];
+        softmax(probs, V);
+
+        float coin = (float) rand() / (float) RAND_MAX;
+        int next_token = sample_multinomial(probs, V, coin);
+
+        // APPEND the token and grow the length (no sliding!)
+        sequence[current_len] = next_token;
+        current_len++;
+
+        if (tokenizer->init_ok) printf("%s", tokenizer_decode(tokenizer, next_token));
+        else printf("%d ", next_token);
+        
+        fflush(stdout);
+    }
+
+    double time_end = clock();
+    double time_taken = time_end - time_start;
+
+    printf("\n\n--- BENCHMARK ---\n");
+    printf("B = %d, T = %d to %d, C = %d, Words Gen = %d\n", 
+        B, T, current_len, model->config.channels, current_len - T);
+    printf("Activations memory used: %d MB\n", benchmark.activations_memory);
+    printf("Total execution time: %.2lfms\n", time_taken / 1000);
+    printf("Allocation time overhead: %.2lfms\n", benchmark.allocation_time / 1000);
+    printf("Total CPU execution time: %.2lfms\n", benchmark.cpu_time / 1000);
+    printf("Average time per word generation: %.2lfms\n", 
+        time_taken / ((current_len - T) * 1000));
+
+    printf("\n");
+
+    free(sequence);
+    free(probs);
+}
+
 int main(int argc, char *argv[]) {
     GPT2 model;
     gpt2_build_from_checkpoint(&model, "../gpt2_124M.bin");
@@ -586,19 +646,10 @@ int main(int argc, char *argv[]) {
     int batch_skips = 0;
     int max_sequence_len = 10;
 
-    // optional command line args: B, T, batch_skips, max_sequence_len
-    if (argc >= 2) {
-        B = atoi(argv[1]);
-    }
-    if (argc >= 3) {
-        T = atoi(argv[2]);
-    }
-    if (argc >= 4) {
-        batch_skips = atoi(argv[3]);
-    }
-    if (argc >= 5) {
-        max_sequence_len = atoi(argv[4]);
-    }
+    if (argc >= 2) B = atoi(argv[1]);
+    if (argc >= 3) T = atoi(argv[2]);
+    if (argc >= 4) batch_skips = atoi(argv[3]);
+    if (argc >= 5) max_sequence_len = atoi(argv[4]);
     
     assert(B > 0 && T > 0 && batch_skips >= 0 && max_sequence_len > 0);
 
@@ -611,83 +662,12 @@ int main(int argc, char *argv[]) {
     srand(time(NULL));
 
     dataloader_next_batch(&train_loader);
-    
     for (int i = 0; i < batch_skips; i++) {
         dataloader_next_batch(&train_loader);
     }
 
-    int V  = model.config.vocab_size;
-    int Vp = model.config.padded_vocab_size;
-
-    // mutable context window seeded from the loaded batch
-    int *gen_tokens = (int*)malloc(B * T * sizeof(int));
-    memcpy(gen_tokens, train_loader.inputs, B * T * sizeof(int));
-
-    float *probs = (float*)malloc(V * sizeof(float)); // reused every step
-
-    Benchmark benchmark;
-    init_benchmark(&benchmark);
-
-    printf("--- PROMPT ---\n");
-    for (int i = 0; i < B * T; i++) {
-        printf("%s", tokenizer_decode(&tokenizer, train_loader.inputs[i])); 
-    }
-
-    // --- Generation loop ---
-    printf("\n--- Generating ---\n");
-
-    double time_start = clock();
-    for (int step = 0; step < max_sequence_len; step++) {
-
-        // forward pass — pass NULL targets (no loss needed during inference)
-        gpt2_forward(&model, gen_tokens, NULL, B, T, &benchmark);
-
-        // --- sample from batch item b=0, last position T-1 ---
-        int b = 0;
-        // logits layout: (B, T, Vp), so offset to [b, T-1, 0]
-        float *logits_last = model.acts.logits + b * T * Vp + (T - 1) * Vp;
-
-        // copy only the real vocab (ignore the padded tail) then softmax
-        for (int i = 0; i < V; i++) probs[i] = logits_last[i];
-        softmax(probs, V);
-
-        float coin      = (float) rand() / (float) RAND_MAX;
-        int next_token  = sample_multinomial(probs, V, coin);
-
-        // decode and print
-        if (tokenizer.init_ok) {
-            const char *tok = tokenizer_decode(&tokenizer, next_token);
-            printf("%s", tok);
-        } else {
-            printf("%d ", next_token);
-        }
-        fflush(stdout);
-
-        // slide the context window left by 1, append the new token
-        for (int t = 0; t < T - 1; t++) {
-            gen_tokens[b * T + t] = gen_tokens[b * T + t + 1];
-        }
-        gen_tokens[b * T + (T - 1)] = next_token;
-    }
-    double time_end = clock();
-    double time_taken = time_end - time_start;
-
-    printf("\n\n--- BENCHMARK ---\n");
-    printf("B = %d, T = %d, C = %d, Words Gen = %d\n", 
-        B, T, model.config.channels, max_sequence_len);
-    printf("Activations memory used: %d MB\n", benchmark.activations_memory);
-    printf("Total execution time: %.2lfms\n", time_taken / 1000);
-    printf("Allocation time overhead: %.2lfms\n", benchmark.allocation_time / 1000);
-    printf("Total CPU execution time: %.2lfms\n", benchmark.cpu_time / 1000);
-    printf("Average time per word generation: %.2lfms\n", 
-        time_taken / (max_sequence_len * 1000));
-    printf("Average time per GPU forward pass: %.2lfms\n", 
-        benchmark.cpu_time / (max_sequence_len * 1000));
-
-    printf("\n");
-
-    free(gen_tokens);
-    free(probs);
+    // Call the new, clean generation function
+    generate_text(&model, &tokenizer, train_loader.inputs, B, T, max_sequence_len);
 
     dataloader_free(&train_loader);
     tokenizer_free(&tokenizer);
