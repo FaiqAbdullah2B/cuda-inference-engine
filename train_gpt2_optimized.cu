@@ -646,29 +646,23 @@ __global__ void attention_forward_kernel(
     int hs = C / NH; 
     
     int batch_offset = b * T * 3 * C;
-    int query_offset = batch_offset + t * 3 * C + h * hs;
-    
+         
     extern __shared__ float smem[];
-    float* s_Q      = smem;                 // size: hs
-    float* s_reduce = smem + hs;            // size: BLOCK_SIZE
-    
-    const float* Q = inp + query_offset;
-    for (int i = tid; i < hs; i += blockDim.x) {
-        s_Q[i] = Q[i];
-    }
-    __syncthreads();
+    float* s_reduce = smem;            // size: BLOCK_SIZE
     
     float scale = 1.0f / sqrtf((float)hs);
     int base_cache_idx = b * NH * T * T + h * T * T + t * T;
 
     for (int t2 = 0; t2 <= t; t2++) {
+        int query_offset = batch_offset + t * 3 * C + h * hs;
         int key_offset = batch_offset + t2 * 3 * C + C + h * hs;
+        const float* Q = inp + query_offset;
         const float* K = inp + key_offset;
         
         // Coalesced memory read into a partial dot product
         float local_dot = 0.0f;
         for (int i = tid; i < hs; i += blockDim.x) {
-            local_dot += s_Q[i] * K[i];
+            local_dot += Q[i] * K[i];
         }
         s_reduce[tid] = local_dot;
         __syncthreads();
@@ -756,11 +750,8 @@ void attention_forward(float *out, float *preatt_cache, float *att_cache, float 
     dim3 grid(T, NH, B);
     dim3 block(BLOCK_SIZE);
     
-    // Head size
-    int hs = C / NH;
-    
-    // Shared memory needs 'hs' size floats for querying cache + BLOCK_SIZE floats for tree reduction
-    size_t shared_mem_bytes = (hs + BLOCK_SIZE) * sizeof(float);
+    // BLOCK_SIZE floats for tree reduction
+    size_t shared_mem_bytes = (BLOCK_SIZE) * sizeof(float);
     
     attention_forward_kernel<<<grid, block, shared_mem_bytes>>>(
         out, preatt_cache, att_cache, inp, B, T, C, NH
